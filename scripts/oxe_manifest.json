@@ -1,0 +1,256 @@
+{
+  "viola": {
+    "versions": [
+      "0.1.0",
+      "0.1.0_$folder$"
+    ],
+    "train_shard0": [
+      "robotics/viola/0.1.0/viola-train.tfrecord-00000-of-00081",
+      120309052
+    ],
+    "meta": [
+      [
+        "robotics/viola/0.1.0/dataset_info.json",
+        2146
+      ],
+      [
+        "robotics/viola/0.1.0/features.json",
+        12050
+      ]
+    ]
+  },
+  "stanford_hydra_dataset_converted_externally_to_rlds": {
+    "versions": [
+      "0.1.0"
+    ],
+    "train_shard0": [
+      "robotics/stanford_hydra_dataset_converted_externally_to_rlds/0.1.0/stanford_hydra_dataset_converted_externally_to_rlds-train.tfrecord-00000-of-00350",
+      111401598
+    ],
+    "meta": [
+      [
+        "robotics/stanford_hydra_dataset_converted_externally_to_rlds/0.1.0/dataset_info.json",
+        5326
+      ],
+      [
+        "robotics/stanford_hydra_dataset_converted_externally_to_rlds/0.1.0/features.json",
+        9618
+      ]
+    ]
+  },
+  "austin_buds_dataset_converted_externally_to_rlds": {
+    "versions": [
+      "0.1.0",
+      "0.1.0_$folder$"
+    ],
+    "train_shard0": [
+      "robotics/austin_buds_dataset_converted_externally_to_rlds/0.1.0/austin_buds_dataset_converted_externally_to_rlds-train.tfrecord-00000-of-00016",
+      30536839
+    ],
+    "meta": [
+      [
+        "robotics/austin_buds_dataset_converted_externally_to_rlds/0.1.0/dataset_info.json",
+        1114
+      ],
+      [
+        "robotics/austin_buds_dataset_converted_externally_to_rlds/0.1.0/features.json",
+        8968
+      ]
+    ]
+  },
+  "austin_sailor_dataset_converted_externally_to_rlds": {
+    "versions": [
+      "0.1.0",
+      "0.1.0_$folder$"
+    ],
+    "train_shard0": [
+      "robotics/austin_sailor_dataset_converted_externally_to_rlds/0.1.0/austin_sailor_dataset_converted_externally_to_rlds-train.tfrecord-00000-of-00109",
+      136427266
+    ],
+    "meta": [
+      [
+        "robotics/austin_sailor_dataset_converted_externally_to_rlds/0.1.0/dataset_info.json",
+        2279
+      ],
+      [
+        "robotics/austin_sailor_dataset_converted_externally_to_rlds/0.1.0/features.json",
+        11759
+      ]
+    ]
+  },
+  "austin_sirius_dataset_converted_externally_to_rlds": {
+    "versions": [
+      "0.1.0",
+      "0.1.0_$folder$"
+    ],
+    "train_shard0": [
+      "robotics/austin_sirius_dataset_converted_externally_to_rlds/0.1.0/austin_sirius_dataset_converted_externally_to_rlds-train.tfrecord-00000-of-00064",
+      178205997
+    ],
+    "meta": [
+      [
+        "robotics/austin_sirius_dataset_converted_externally_to_rlds/0.1.0/dataset_info.json",
+        1743
+      ],
+      [
+        "robotics/austin_sirius_dataset_converted_externally_to_rlds/0.1.0/features.json",
+        13360
+      ]
+    ]
+  },
+  "utaustin_mutex": {
+    "versions": [
+      "0.1.0"
+    ],
+    "train_shard0": [
+      "robotics/utaustin_mutex/0.1.0/utaustin_mutex-train.tfrecord-00000-of-00256",
+      30937693
+    ],
+    "meta": [
+      [
+        "robotics/utaustin_mutex/0.1.0/dataset_info.json",
+        4228
+      ],
+      [
+        "robotics/utaustin_mutex/0.1.0/features.json",
+        8991
+      ]
+    ]
+  },
+  "furniture_bench_dataset_converted_externally_to_rlds": {
+    "versions": [
+      "0.1.0"
+    ],
+    "train_shard0": [
+      "robotics/furniture_bench_dataset_converted_externally_to_rlds/0.1.0/furniture_bench_dataset_converted_externally_to_rlds-train.tfrecord-00000-of-01016",
+      65766325
+    ],
+    "meta": [
+      [
+        "robotics/furniture_bench_dataset_converted_externally_to_rlds/0.1.0/dataset_info.json",
+        14101
+      ],
+      [
+        "robotics/furniture_bench_dataset_converted_externally_to_rlds/0.1.0/features.json",
+        10200
+      ]
+    ]
+  },
+  "iamlab_cmu_pickup_insert_converted_externally_to_rlds": {
+    "versions": [
+      "0.1.0"
+    ],
+    "train_shard0": [
+      "robotics/iamlab_cmu_pickup_insert_converted_externally_to_rlds/0.1.0/iamlab_cmu_pickup_insert_converted_externally_to_rlds-train.tfrecord-00000-of-00369",
+      230585921
+    ],
+    "meta": [
+      [
+        "robotics/iamlab_cmu_pickup_insert_converted_externally_to_rlds/0.1.0/dataset_info.json",
+        5707
+      ],
+      [
+        "robotics/iamlab_cmu_pickup_insert_converted_externally_to_rlds/0.1.0/features.json",
+        8992
+      ]
+    ]
+  },
+  "taco_play": {
+    "versions": [
+      "0.1.0"
+    ],
+    "train_shard0": [
+      "robotics/taco_play/0.1.0/taco_play-train.tfrecord-00000-of-00511",
+      100088911
+    ],
+    "meta": [
+      [
+        "robotics/taco_play/0.1.0/dataset_info.json",
+        8874
+      ],
+      [
+        "robotics/taco_play/0.1.0/features.json",
+        13914
+      ]
+    ]
+  },
+  "ucsd_kitchen_dataset_converted_externally_to_rlds": {
+    "versions": [
+      "0.1.0",
+      "0.1.0_$folder$"
+    ],
+    "train_shard0": [
+      "robotics/ucsd_kitchen_dataset_converted_externally_to_rlds/0.1.0/ucsd_kitchen_dataset_converted_externally_to_rlds-train.tfrecord-00000-of-00016",
+      48239521
+    ],
+    "meta": [
+      [
+        "robotics/ucsd_kitchen_dataset_converted_externally_to_rlds/0.1.0/dataset_info.json",
+        920
+      ],
+      [
+        "robotics/ucsd_kitchen_dataset_converted_externally_to_rlds/0.1.0/features.json",
+        7970
+      ]
+    ]
+  },
+  "ucsd_pick_and_place_dataset_converted_externally_to_rlds": {
+    "versions": [
+      "0.1.0",
+      "0.1.0_$folder$"
+    ],
+    "train_shard0": [
+      "robotics/ucsd_pick_and_place_dataset_converted_externally_to_rlds/0.1.0/ucsd_pick_and_place_dataset_converted_externally_to_rlds-train.tfrecord-00000-of-00032",
+      133216730
+    ],
+    "meta": [
+      [
+        "robotics/ucsd_pick_and_place_dataset_converted_externally_to_rlds/0.1.0/dataset_info.json",
+        1242
+      ],
+      [
+        "robotics/ucsd_pick_and_place_dataset_converted_externally_to_rlds/0.1.0/features.json",
+        9528
+      ]
+    ]
+  },
+  "cmu_franka_exploration_dataset_converted_externally_to_rlds": {
+    "versions": [
+      "0.1.0",
+      "0.1.0_$folder$"
+    ],
+    "train_shard0": [
+      "robotics/cmu_franka_exploration_dataset_converted_externally_to_rlds/0.1.0/cmu_franka_exploration_dataset_converted_externally_to_rlds-train.tfrecord-00000-of-00008",
+      98325932
+    ],
+    "meta": [
+      [
+        "robotics/cmu_franka_exploration_dataset_converted_externally_to_rlds/0.1.0/dataset_info.json",
+        952
+      ],
+      [
+        "robotics/cmu_franka_exploration_dataset_converted_externally_to_rlds/0.1.0/features.json",
+        8897
+      ]
+    ]
+  },
+  "nyu_franka_play_dataset_converted_externally_to_rlds": {
+    "versions": [
+      "0.1.0"
+    ],
+    "train_shard0": [
+      "robotics/nyu_franka_play_dataset_converted_externally_to_rlds/0.1.0/nyu_franka_play_dataset_converted_externally_to_rlds-train.tfrecord-00000-of-00032",
+      123273631
+    ],
+    "meta": [
+      [
+        "robotics/nyu_franka_play_dataset_converted_externally_to_rlds/0.1.0/dataset_info.json",
+        1693
+      ],
+      [
+        "robotics/nyu_franka_play_dataset_converted_externally_to_rlds/0.1.0/features.json",
+        11046
+      ]
+    ]
+  }
+}

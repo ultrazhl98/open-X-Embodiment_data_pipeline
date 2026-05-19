@@ -1,0 +1,19 @@
+# Data (downloaded raw shards + converted LeRobot outputs) — too large for git
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.ipynb_checkpoints/
+
+# Env / IDE
+.env
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
