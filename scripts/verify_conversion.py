@@ -46,13 +46,30 @@ from oxe_lerobot.rlds_reader import iter_episodes  # noqa: E402
 from oxe_lerobot.transforms import (  # noqa: E402
     ACTION_FNS,
     _quat_wxyz_to_euler_xyz,
+    euler_xyz_to_quat_wxyz,
     finalize_actions_to_delta,
     quat_relative_wxyz,
     standardize_step,
 )
 
 
-VERIFY = ["viola", "iamlab_cmu_pickup_insert", "furniture_bench"]
+VERIFY = [
+    # already vetted in earlier pass
+    "viola",
+    "iamlab_cmu_pickup_insert",
+    "furniture_bench",
+    # newly added in this pass
+    "stanford_hydra",
+    "austin_buds",
+    "austin_sailor",
+    "austin_sirius",
+    "utaustin_mutex",
+    "taco_play",
+    "nyu_franka_play",
+    "ucsd_kitchen",
+    "ucsd_pick_and_place",
+    "cmu_franka_exploration",
+]
 
 
 # ---------------------------- IO helpers ---------------------------- #
@@ -131,6 +148,23 @@ def independent_expected_action(cfg, raw_steps: list[dict]) -> np.ndarray:
         out[n - 1, 6]  = states[n - 1, 34]
         return out
 
+    if cfg.action_kind == "abs_euler_7d_to_delta":
+        # ucsd_kitchen: 8D abs [xyz(mm), euler(deg), grip, terminate] → 7D delta in SI.
+        raws = np.stack([np.asarray(s["action"], dtype=np.float64) for s in raw_steps])
+        n = len(raws)
+        out = np.zeros((n, 7), dtype=np.float32)
+        deg2rad = np.pi / 180.0
+        for t in range(n - 1):
+            out[t, :3] = (raws[t + 1, :3] - raws[t, :3]) * 1e-3
+            q_curr = euler_xyz_to_quat_wxyz(raws[t, 3:6]     * deg2rad)
+            q_next = euler_xyz_to_quat_wxyz(raws[t + 1, 3:6] * deg2rad)
+            q_rel  = quat_relative_wxyz(q_curr, q_next)
+            out[t, 3:6] = _quat_wxyz_to_euler_xyz(q_rel)
+            out[t, 6]   = raws[t, 6]
+        out[n - 1, :6] = 0.0
+        out[n - 1, 6]  = raws[n - 1, 6]
+        return out
+
     # Already-delta kinds — just run the per-step function.
     fn = ACTION_FNS[cfg.action_kind]
     return np.stack([fn(s, None) for s in raw_steps])
@@ -152,29 +186,71 @@ def numerical_equivalence(cfg, raw_steps, parquet_action) -> dict:
 
 # ---------------------------- ② correlation w/ state velocity ---------------------------- #
 
+def _col_major_mat16_to_pos_R(mat16: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Column-major (Fortran/MuJoCo) 4×4 flattened to 16 → (pos (3,), R (3,3))."""
+    M = np.asarray(mat16, dtype=np.float64).reshape(4, 4).T
+    return M[:3, 3].copy(), M[:3, :3].copy()
+
+
 def extract_ee_xyz(cfg, lerobot_state: np.ndarray, raw_steps: list[dict]) -> np.ndarray | None:
     """Return (N, 3) end-effector position trajectory, or None if not available."""
-    if cfg.name == "viola":
-        # synthesized state = [pos(3), euler(3), gripper(1)]
-        return lerobot_state[:, :3]
-    if cfg.name == "furniture_bench":
-        # state = [3 ee_pos, 4 ee_quat, 3 ee_linvel, 3 ee_angvel, 7 joint, 7 jvel, 7 jtorque, 1 grip]
-        return lerobot_state[:, :3]
-    if cfg.name == "iamlab_cmu_pickup_insert":
-        # state has no EE position; raw action stores the absolute target xyz
+    name = cfg.name
+    if name == "viola":
+        return lerobot_state[:, :3]                           # synth: [pos, euler, grip]
+    if name == "stanford_hydra":
+        return lerobot_state[:, :3]                           # state: [pos, quat_wxyz, euler, ...]
+    if name in ("austin_buds", "utaustin_mutex"):
+        # state: [7 joint, 1 grip, 16 ee_mat_col_major]
+        return np.stack([_col_major_mat16_to_pos_R(lerobot_state[t, 8:24])[0]
+                         for t in range(len(lerobot_state))])
+    if name in ("austin_sailor", "austin_sirius"):
+        # default state is just 8D (joint+grip); EE matrix is at raw obs.state_ee
+        return np.stack([_col_major_mat16_to_pos_R(
+            np.asarray(s["observation"]["state_ee"], dtype=np.float64))[0]
+                         for s in raw_steps])
+    if name == "furniture_bench":
+        return lerobot_state[:, :3]                           # [pos, quat, ...]
+    if name == "iamlab_cmu_pickup_insert":
         return np.stack([np.asarray(s["action"], dtype=np.float32)[:3] for s in raw_steps])
-    return None
+    if name == "taco_play":
+        return lerobot_state[:, :3]                           # robot_obs: [pos, euler, grip, ...]
+    if name == "nyu_franka_play":
+        return lerobot_state[:, 7:10]                         # state: [7 joint, 3 xyz, 3 rpy]
+    if name == "ucsd_kitchen":
+        # state is 21D joints only; raw action stores absolute pose in mm.
+        return np.stack([np.asarray(s["action"], dtype=np.float64)[:3] * 1e-3
+                         for s in raw_steps])                  # mm → m
+    if name == "ucsd_pick_and_place":
+        return lerobot_state[:, :3]                           # state: [3 gripper_pos, 3 ori, 1 fingers]
+    return None                                               # cmu_franka_exploration: no state, no abs pose
+
+
+def _mask_clean_frames(ee_xyz: np.ndarray) -> np.ndarray:
+    """Drop frames where the EE position is exactly (0, 0, 0) — these come from
+    degenerate / missing state-matrix entries (e.g. austin_buds frame 408 has
+    an all-zero 4x4 homogeneous matrix). Returns a boolean mask of length N."""
+    return np.linalg.norm(ee_xyz, axis=1) > 1e-6
 
 
 def correlation_per_axis(action: np.ndarray, ee_xyz: np.ndarray) -> list[float]:
+    """Pearson r between action[:3] and the per-frame state-EE displacement.
+
+    Robust to:
+      - degenerate state frames (EE pos ≈ 0, 0, 0) — those are dropped
+      - per-axis constant signals (returns NaN with 'bad' style)
+    """
     vel = np.diff(ee_xyz, axis=0)            # (N-1, 3)
     a = action[:-1, :3]                      # align lengths
     n = min(len(vel), len(a))
     vel, a = vel[:n], a[:n]
+    # Mask out frames adjacent to degenerate state entries
+    clean = _mask_clean_frames(ee_xyz[:-1]) & _mask_clean_frames(ee_xyz[1:])
+    clean = clean[:n]
+    vel, a = vel[clean], a[clean]
     rs = []
     for axis in range(3):
         v, x = vel[:, axis], a[:, axis]
-        if v.std() < 1e-9 or x.std() < 1e-9:
+        if len(v) < 3 or v.std() < 1e-9 or x.std() < 1e-9:
             rs.append(float("nan"))
         else:
             rs.append(float(np.corrcoef(v, x)[0, 1]))
@@ -186,11 +262,14 @@ def plot_action_vs_velocity(action: np.ndarray, ee_xyz: np.ndarray, title: str) 
     a = action[:-1, :3]
     n = min(len(vel), len(a))
     vel, a = vel[:n], a[:n]
+    clean = _mask_clean_frames(ee_xyz[:-1]) & _mask_clean_frames(ee_xyz[1:])
+    clean = clean[:n]
+    vel, a = vel[clean], a[clean]
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     for axis in range(3):
         v, x = vel[:, axis], a[:, axis]
         r = (np.corrcoef(v, x)[0, 1]
-             if v.std() > 1e-9 and x.std() > 1e-9 else float("nan"))
+             if len(v) > 2 and v.std() > 1e-9 and x.std() > 1e-9 else float("nan"))
         axes[axis].scatter(v, x, s=4, alpha=0.5)
         axes[axis].set_title(f"axis {'xyz'[axis]}  r = {r:.3f}")
         axes[axis].set_xlabel("state Δ (next - current)")
@@ -260,26 +339,68 @@ def euler_xyz_to_rotmat(rpy: np.ndarray) -> np.ndarray:
 def extract_rotations(cfg, lerobot_state: np.ndarray, raw_steps: list[dict]) -> np.ndarray | None:
     """Return (N, 3, 3) rotation matrices describing the EE orientation per frame.
     Returns None if the dataset doesn't expose EE orientation."""
+    name = cfg.name
     n = len(raw_steps)
     R = np.zeros((n, 3, 3), dtype=np.float64)
-    if cfg.name == "viola":
-        # synthesized state: [pos(3), euler_xyz(3), gripper(1)] — euler at [3:6]
+
+    if name == "viola":
         for t in range(n):
             R[t] = euler_xyz_to_rotmat(lerobot_state[t, 3:6])
         return R
-    if cfg.name == "furniture_bench":
-        # state[3:7] is quat_wxyz (verified empirically)
+
+    if name == "stanford_hydra":
+        # state[3:7] is (w, x, y, z) (largest component at index 0; verified)
+        for t in range(n):
+            R[t] = quat_wxyz_to_rotmat(lerobot_state[t, 3:7])
+        return R
+
+    if name in ("austin_buds", "utaustin_mutex"):
+        for t in range(n):
+            _, R[t] = _col_major_mat16_to_pos_R(lerobot_state[t, 8:24])
+        return R
+
+    if name in ("austin_sailor", "austin_sirius"):
+        for t in range(n):
+            mat = np.asarray(raw_steps[t]["observation"]["state_ee"], dtype=np.float64)
+            _, R[t] = _col_major_mat16_to_pos_R(mat)
+        return R
+
+    if name == "furniture_bench":
         for t in range(n):
             q = np.asarray(raw_steps[t]["observation"]["state"], dtype=np.float64)[3:7]
             R[t] = quat_wxyz_to_rotmat(q)
         return R
-    if cfg.name == "iamlab_cmu_pickup_insert":
-        # raw action[3:7] is target quat_wxyz (verified empirically)
+
+    if name == "iamlab_cmu_pickup_insert":
         for t in range(n):
             q = np.asarray(raw_steps[t]["action"], dtype=np.float64)[3:7]
             R[t] = quat_wxyz_to_rotmat(q)
         return R
-    return None
+
+    if name == "taco_play":
+        # robot_obs[3:6] is euler (radians) — values span ±π so it's rad, not deg
+        for t in range(n):
+            R[t] = euler_xyz_to_rotmat(lerobot_state[t, 3:6])
+        return R
+
+    if name == "nyu_franka_play":
+        for t in range(n):
+            R[t] = euler_xyz_to_rotmat(lerobot_state[t, 10:13])
+        return R
+
+    if name == "ucsd_kitchen":
+        # raw action euler is in degrees → convert to rad
+        for t in range(n):
+            rpy_deg = np.asarray(raw_steps[t]["action"], dtype=np.float64)[3:6]
+            R[t] = euler_xyz_to_rotmat(rpy_deg * np.pi / 180.0)
+        return R
+
+    if name == "ucsd_pick_and_place":
+        for t in range(n):
+            R[t] = euler_xyz_to_rotmat(lerobot_state[t, 3:6])
+        return R
+
+    return None  # cmu_franka_exploration: no EE pose available
 
 
 def _downsample_indices(n: int, target: int = 40) -> list[int]:

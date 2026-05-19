@@ -8,8 +8,11 @@ Action conversion kinds:
   - "delta_7d_pack":    action is a dict with separate world_vector/rotation_delta/gripper.
   - "abs_quat_7d":      action is 8D absolute [xyz, quat_wxyz, gripper] — finalize pass
                         diffs successive commands using quaternion-relative math.
-  - "abs_euler_7d":     action is 8D absolute [xyz, euler, gripper, terminate] — drop terminate.
-                        (NOTE: currently does NOT diff to delta — known gap for ucsd_kitchen.)
+  - "abs_euler_7d":     action is 8D [xyz, euler, gripper, terminate] — drop terminate.
+                        Used by cmu_franka_exploration where values are already deltas.
+  - "abs_euler_7d_to_delta": action is 8D ABSOLUTE [xyz, euler, gripper, terminate].
+                        Finalize converts to 7D delta with quat-relative rotation and
+                        optional unit normalization (mm→m, deg→rad). Used by ucsd_kitchen.
   - "joint_vel_plus_delta": action is 15D, slice [7:13] (Δxyz, Δrpy) + [13] (gripper) → 7D.
   - "furniture_state_delta": action derived from state EE pose; finalize pass computes
                         delta from successive states. Bypasses the raw "quat velocity" field.
@@ -147,7 +150,10 @@ DATASETS: dict[str, DatasetConfig] = {
         image_primary_key="image",
         image_wrist_key=None,
         state_key="state",
-        action_kind="abs_euler_7d",
+        action_kind="abs_euler_7d_to_delta",
+        notes="action is absolute pose [xyz(mm), euler(deg), grip, terminate]. "
+              "Finalize converts to 7D delta with mm→m + deg→rad normalization; "
+              "rotation uses quat-relative math to avoid ±π wrap (range is full ±180°).",
     ),
     "ucsd_pick_and_place_dataset_converted_externally_to_rlds": DatasetConfig(
         name="ucsd_pick_and_place",
@@ -168,7 +174,10 @@ DATASETS: dict[str, DatasetConfig] = {
         image_secondary_key="highres_image",
         state_key=None,  # no proprio state field
         action_kind="abs_euler_7d",
-        notes="action 8D [3 pos, 3 ori, gripper, terminate] — drop terminate, treat as delta per Excel doc",
+        notes="action 8D [Δxyz, Δrpy, gripper, terminate]. Schema description "
+              "says 'position/orientation' but empirically values are deltas "
+              "(rotation range only ±0.06 rad, position range ≈ consec-Δ). "
+              "We trust the Excel doc + data; just drop terminate.",
     ),
 }
 

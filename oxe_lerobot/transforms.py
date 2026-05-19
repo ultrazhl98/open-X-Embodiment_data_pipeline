@@ -58,6 +58,21 @@ def quat_relative_wxyz(q_from: np.ndarray, q_to: np.ndarray) -> np.ndarray:
     return quat_mul_wxyz(q_to, quat_conj_wxyz(q_from))
 
 
+def euler_xyz_to_quat_wxyz(rpy: np.ndarray) -> np.ndarray:
+    """XYZ Tait-Bryan euler (in radians) → (w, x, y, z) unit quaternion.
+    Matches the convention used by `_quat_wxyz_to_euler_xyz` (R = Rz·Ry·Rx)."""
+    r = float(rpy[0]); p = float(rpy[1]); y = float(rpy[2])
+    cr, sr = np.cos(r / 2.0), np.sin(r / 2.0)
+    cp, sp = np.cos(p / 2.0), np.sin(p / 2.0)
+    cy, sy = np.cos(y / 2.0), np.sin(y / 2.0)
+    return np.array([
+        cy * cp * cr + sy * sp * sr,
+        cy * cp * sr - sy * sp * cr,
+        cy * sp * cr + sy * cp * sr,
+        sy * cp * cr - cy * sp * sr,
+    ], dtype=np.float64)
+
+
 def homogeneous16_to_pos_euler(mat16: np.ndarray, column_major: bool = True) -> np.ndarray:
     """4x4 matrix flattened to 16 → (3 pos, 3 euler).
 
@@ -175,14 +190,15 @@ def action_delta_xyz_only_4d(step, prev_state) -> np.ndarray:
 
 
 ACTION_FNS = {
-    "delta_7d":              action_delta_7d,
-    "delta_7d_pack":         action_delta_7d_pack,
-    "taco_rel_world":        action_taco_rel_world,
-    "joint_vel_plus_delta":  action_joint_vel_plus_delta,
-    "furniture_state_delta": action_furniture_state_delta,
-    "abs_euler_7d":          action_abs_euler_7d,
-    "abs_quat_7d":           action_abs_quat_7d,
-    "delta_xyz_only_4d":     action_delta_xyz_only_4d,
+    "delta_7d":                 action_delta_7d,
+    "delta_7d_pack":            action_delta_7d_pack,
+    "taco_rel_world":           action_taco_rel_world,
+    "joint_vel_plus_delta":     action_joint_vel_plus_delta,
+    "furniture_state_delta":    action_furniture_state_delta,
+    "abs_euler_7d":             action_abs_euler_7d,            # cmu_franka_exploration: values are deltas
+    "abs_euler_7d_to_delta":    action_abs_euler_7d,            # ucsd_kitchen: finalize does abs→delta
+    "abs_quat_7d":              action_abs_quat_7d,
+    "delta_xyz_only_4d":        action_delta_xyz_only_4d,
 }
 
 
@@ -308,6 +324,38 @@ def _quat_wxyz_to_euler_xyz(q: np.ndarray) -> np.ndarray:
     return np.array([roll, pitch, yaw], dtype=np.float32)
 
 
+def _finalize_via_euler_to_delta(canonical_steps: list[dict],
+                                 pos_scale: float = 1.0,
+                                 rot_in_degrees: bool = False) -> list[dict]:
+    """For ucsd_kitchen-style datasets where the action is an absolute pose
+    `[xyz, euler, gripper]` (after dropping `terminate`).  Convert to 7D delta
+    with **look-ahead** convention.  Rotation goes through quaternions
+    (euler→quat, q_rel, quat→euler) so ±π wraparound doesn't bite.  Optional
+    unit normalization: ucsd_kitchen stores position in mm and rotation in
+    degrees, so we pass `pos_scale=1e-3, rot_in_degrees=True` to land in
+    standard SI units (m + rad)."""
+    n = len(canonical_steps)
+    out = []
+    deg2rad = np.pi / 180.0 if rot_in_degrees else 1.0
+    for t, s in enumerate(canonical_steps):
+        raw = np.asarray(s["action"], dtype=np.float64)  # 7D [pos, euler, grip]
+        if t == n - 1:
+            delta = np.zeros(7, dtype=np.float32)
+            delta[6] = float(raw[6])  # gripper as-is
+        else:
+            nxt = np.asarray(canonical_steps[t + 1]["action"], dtype=np.float64)
+            dxyz = (nxt[:3] - raw[:3]) * pos_scale
+            e_curr = raw[3:6] * deg2rad
+            e_next = nxt[3:6] * deg2rad
+            q_curr = euler_xyz_to_quat_wxyz(e_curr)
+            q_next = euler_xyz_to_quat_wxyz(e_next)
+            q_rel = quat_relative_wxyz(q_curr, q_next)
+            drpy = _quat_wxyz_to_euler_xyz(q_rel)         # radians
+            delta = np.concatenate([dxyz, drpy, [raw[6]]]).astype(np.float32)
+        out.append({**s, "action": delta})
+    return out
+
+
 def finalize_actions_to_delta(canonical_steps: list[dict], cfg) -> list[dict]:
     """Second pass to compute the final 7D delta action for datasets whose
     per-step `action_fn` only emitted an intermediate (raw target pose or
@@ -316,4 +364,9 @@ def finalize_actions_to_delta(canonical_steps: list[dict], cfg) -> list[dict]:
         return _finalize_via_command_delta(canonical_steps)
     if cfg.action_kind == "furniture_state_delta":
         return _finalize_via_state_delta(canonical_steps)
+    if cfg.action_kind == "abs_euler_7d_to_delta":
+        # ucsd_kitchen: 8D abs [xyz(mm), euler(deg), grip, terminate] → 7D delta in SI units.
+        return _finalize_via_euler_to_delta(canonical_steps,
+                                            pos_scale=1e-3,
+                                            rot_in_degrees=True)
     return canonical_steps
