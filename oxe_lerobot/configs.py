@@ -6,10 +6,13 @@ each entry describes how to pull the canonical fields out of a raw RLDS step.
 Action conversion kinds:
   - "delta_7d":         action is already 7D [Δxyz, Δrpy, gripper] — use as-is.
   - "delta_7d_pack":    action is a dict with separate world_vector/rotation_delta/gripper.
-  - "abs_quat_7d":      action is 8D absolute [xyz, quat, gripper] — convert to 7D delta.
-  - "abs_euler_7d":     action is 8D absolute [xyz, euler, gripper, terminate] — drop terminate, convert to delta.
+  - "abs_quat_7d":      action is 8D absolute [xyz, quat_wxyz, gripper] — finalize pass
+                        diffs successive commands using quaternion-relative math.
+  - "abs_euler_7d":     action is 8D absolute [xyz, euler, gripper, terminate] — drop terminate.
+                        (NOTE: currently does NOT diff to delta — known gap for ucsd_kitchen.)
   - "joint_vel_plus_delta": action is 15D, slice [7:13] (Δxyz, Δrpy) + [13] (gripper) → 7D.
-  - "delta_furniture_8d":   action is 8D [3 lin_vel, 4 quat_vel, 1 gripper] — convert quat_vel→euler_vel.
+  - "furniture_state_delta": action derived from state EE pose; finalize pass computes
+                        delta from successive states. Bypasses the raw "quat velocity" field.
   - "delta_xyz_only_4d":    action is 4D [3 lin_vel, 1 gripper] — pad rotation with zeros.
   - "taco_rel_world":   pick action['rel_actions_world'] (7D) directly.
 
@@ -101,8 +104,9 @@ DATASETS: dict[str, DatasetConfig] = {
         image_primary_key="image",
         image_wrist_key="wrist_image",
         state_key="state",
-        action_kind="delta_furniture_8d",
-        notes="action = 3 lin_vel + 4 quat_vel + 1 gripper → convert quat→euler for unified 7D",
+        action_kind="furniture_state_delta",
+        notes="action derived from state ΔEE pose (state[t+1]-state[t]); raw action's "
+              "quat_velocity is geometrically ambiguous so we sidestep it. Gripper = state[34] width.",
     ),
     "iamlab_cmu_pickup_insert_converted_externally_to_rlds": DatasetConfig(
         name="iamlab_cmu_pickup_insert",

@@ -35,6 +35,29 @@ def quat_to_euler_xyz(quat: np.ndarray) -> np.ndarray:
     return np.stack([roll, pitch, yaw], axis=-1).astype(np.float32)
 
 
+def quat_mul_wxyz(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Hamilton product of two unit quaternions in (w, x, y, z) order."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ], dtype=np.float64)
+
+
+def quat_conj_wxyz(q: np.ndarray) -> np.ndarray:
+    """Conjugate (== inverse for unit quat). Input/output in (w, x, y, z)."""
+    return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float64)
+
+
+def quat_relative_wxyz(q_from: np.ndarray, q_to: np.ndarray) -> np.ndarray:
+    """Rotation that takes q_from to q_to:  q_rel = q_to · q_from⁻¹.
+    Both inputs and output are (w, x, y, z) unit quaternions."""
+    return quat_mul_wxyz(q_to, quat_conj_wxyz(q_from))
+
+
 def homogeneous16_to_pos_euler(mat16: np.ndarray, column_major: bool = True) -> np.ndarray:
     """4x4 matrix flattened to 16 → (3 pos, 3 euler).
 
@@ -97,14 +120,28 @@ def action_joint_vel_plus_delta(step, prev_state) -> np.ndarray:
 
 
 def action_delta_furniture_8d(step, prev_state) -> np.ndarray:
-    # furniture_bench: 8D [3 lin_vel, 4 quat_vel (w,x,y,z), 1 gripper] → 7D euler
-    a = _ensure_1d(step["action"])
-    assert a.shape == (8,), f"expected 8D, got {a.shape}"
-    pos = a[:3]
-    quat = a[3:7]
-    grip = a[7:8]
-    euler = quat_to_euler_xyz(quat)
-    return np.concatenate([pos, euler, grip]).astype(np.float32)
+    """DEPRECATED — kept only for reference / backwards compat.
+
+    Original implementation treated furniture_bench's `quat velocity` field as
+    if it were a quaternion and ran it through quat→euler. That is
+    geometrically meaningless (a quaternion derivative is not a unit quat).
+    Use `furniture_state_delta` instead, which derives the action from
+    successive state EE poses.
+    """
+    raise RuntimeError("delta_furniture_8d is deprecated — use furniture_state_delta")
+
+
+def action_furniture_state_delta(step, prev_state) -> np.ndarray:
+    """For furniture_bench: pack [ee_pos(3), ee_quat_wxyz(4), gripper_width(1)] from
+    the observation state. The finalize pass computes the 7D delta from
+    successive packed states."""
+    obs = step["observation"]
+    state = _ensure_1d(obs["state"])
+    assert state.shape == (35,), f"expected 35D state, got {state.shape}"
+    ee_pos  = state[0:3]
+    ee_quat = state[3:7]          # (w, x, y, z) — verified empirically
+    grip    = state[34:35]
+    return np.concatenate([ee_pos, ee_quat, grip]).astype(np.float32)
 
 
 def action_abs_euler_7d(step, prev_state) -> np.ndarray:
@@ -116,16 +153,18 @@ def action_abs_euler_7d(step, prev_state) -> np.ndarray:
 
 
 def action_abs_quat_7d(step, prev_state) -> np.ndarray:
-    # iamlab_cmu_pickup_insert: 8D absolute [xyz, quat(x,y,z,w), gripper]
-    # Convert to current absolute (xyz, euler, gripper); caller will diff to prev.
+    """For iamlab_cmu_pickup_insert: keep the raw 8D `[xyz, quat_wxyz, gripper]`
+    target pose. The finalize pass converts successive target poses to a 7D
+    EEF delta using quaternion-relative rotation (avoids Euler ±π wrap).
+
+    Important: iamlab quat order is **(w, x, y, z)** — verified empirically by
+    observing index 1 ≈ 1.0 (gripper-pointing-down corresponds to 180° about
+    x-axis, i.e. (0, 1, 0, 0) in (w, x, y, z)).  The previous assumption
+    (x, y, z, w) was wrong and silently rotated the euler axes by one slot.
+    """
     a = _ensure_1d(step["action"])
     assert a.shape == (8,), f"expected 8D, got {a.shape}"
-    pos = a[:3]
-    # NOTE: iamlab quat order is (x, y, z, w) per inspection of TFDS spec.
-    qx, qy, qz, qw = a[3], a[4], a[5], a[6]
-    euler = quat_to_euler_xyz(np.array([qw, qx, qy, qz]))
-    grip = a[7:8]
-    return np.concatenate([pos, euler, grip]).astype(np.float32)
+    return a.astype(np.float32)  # finalize_actions_to_delta will diff successive quats
 
 
 def action_delta_xyz_only_4d(step, prev_state) -> np.ndarray:
@@ -140,7 +179,7 @@ ACTION_FNS = {
     "delta_7d_pack":         action_delta_7d_pack,
     "taco_rel_world":        action_taco_rel_world,
     "joint_vel_plus_delta":  action_joint_vel_plus_delta,
-    "delta_furniture_8d":    action_delta_furniture_8d,
+    "furniture_state_delta": action_furniture_state_delta,
     "abs_euler_7d":          action_abs_euler_7d,
     "abs_quat_7d":           action_abs_quat_7d,
     "delta_xyz_only_4d":     action_delta_xyz_only_4d,
@@ -203,22 +242,78 @@ def standardize_step(cfg, raw_step: dict, prev_canonical: dict | None) -> dict:
     }
 
 
-def finalize_actions_to_delta(canonical_steps: list[dict], cfg) -> list[dict]:
-    """Some datasets emit ABSOLUTE poses per step (iamlab); convert to delta in
-    a second pass once the full episode is known. No-op for already-delta kinds."""
-    if cfg.action_kind != "abs_quat_7d":
-        return canonical_steps
+def _finalize_via_command_delta(canonical_steps: list[dict]) -> list[dict]:
+    """For iamlab: each step's action is the raw 8D target pose
+    `[xyz, quat_wxyz, gripper]`. Compute 7D delta with **look-ahead**
+    convention to match OXE/Octo's `action[t] = state[t+1] - state[t]`:
+        action[t] = command[t+1] - command[t]   for  t < N-1
+        action[N-1] = 0 (no next target)
+    Rotation uses quaternion-relative math (q_rel = q_next · q_curr⁻¹) and a
+    single quat→euler — avoids ±π Euler wrap."""
+    n = len(canonical_steps)
     out = []
-    prev = None
-    for s in canonical_steps:
-        a = s["action"].copy()
-        if prev is None:
-            d = np.zeros(7, dtype=np.float32)
+    for t, s in enumerate(canonical_steps):
+        raw = np.asarray(s["action"], dtype=np.float64)  # 8D
+        if t == n - 1:
+            delta = np.zeros(7, dtype=np.float32)
+            delta[6] = float(raw[7])
         else:
-            d = np.zeros(7, dtype=np.float32)
-            d[:6] = a[:6] - prev[:6]
-        d[6] = a[6]  # gripper stays absolute
-        s = {**s, "action": d.astype(np.float32)}
-        out.append(s)
-        prev = a
+            nxt = np.asarray(canonical_steps[t + 1]["action"], dtype=np.float64)
+            dxyz = nxt[:3] - raw[:3]
+            q_rel = quat_relative_wxyz(raw[3:7], nxt[3:7])
+            drpy = _quat_wxyz_to_euler_xyz(q_rel)
+            delta = np.concatenate([dxyz, drpy, [raw[7]]]).astype(np.float32)
+        out.append({**s, "action": delta})
     return out
+
+
+def _finalize_via_state_delta(canonical_steps: list[dict]) -> list[dict]:
+    """For furniture_bench: each step's action is the packed
+    `[ee_pos, ee_quat_wxyz, gripper_width]` from the state observation.
+    Compute 7D delta to the NEXT state (not previous) — i.e. action[t] is
+    the motion that takes state[t] → state[t+1]. This is the standard
+    OXE/Octo convention.
+
+    Last frame has no next state → emit zero delta + current gripper.
+    """
+    n = len(canonical_steps)
+    out = []
+    for t, s in enumerate(canonical_steps):
+        raw = np.asarray(s["action"], dtype=np.float64)  # 8D from state
+        if t == n - 1:
+            delta = np.zeros(7, dtype=np.float32)
+            delta[6] = float(raw[7])
+        else:
+            nxt = np.asarray(canonical_steps[t + 1]["action"], dtype=np.float64)
+            dxyz = nxt[:3] - raw[:3]
+            q_rel = quat_relative_wxyz(raw[3:7], nxt[3:7])
+            drpy = _quat_wxyz_to_euler_xyz(q_rel)
+            delta = np.concatenate([dxyz, drpy, [raw[7]]]).astype(np.float32)
+        out.append({**s, "action": delta})
+    return out
+
+
+def _quat_wxyz_to_euler_xyz(q: np.ndarray) -> np.ndarray:
+    """Same math as quat_to_euler_xyz, but on (w,x,y,z) directly. Returns
+    XYZ Tait-Bryan euler (roll, pitch, yaw) as float32."""
+    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    sinr = 2.0 * (w * x + y * z)
+    cosr = 1.0 - 2.0 * (x * x + y * y)
+    roll = np.arctan2(sinr, cosr)
+    sinp = np.clip(2.0 * (w * y - z * x), -1.0, 1.0)
+    pitch = np.arcsin(sinp)
+    siny = 2.0 * (w * z + x * y)
+    cosy = 1.0 - 2.0 * (y * y + z * z)
+    yaw = np.arctan2(siny, cosy)
+    return np.array([roll, pitch, yaw], dtype=np.float32)
+
+
+def finalize_actions_to_delta(canonical_steps: list[dict], cfg) -> list[dict]:
+    """Second pass to compute the final 7D delta action for datasets whose
+    per-step `action_fn` only emitted an intermediate (raw target pose or
+    packed state). No-op for already-delta kinds."""
+    if cfg.action_kind == "abs_quat_7d":
+        return _finalize_via_command_delta(canonical_steps)
+    if cfg.action_kind == "furniture_state_delta":
+        return _finalize_via_state_delta(canonical_steps)
+    return canonical_steps
