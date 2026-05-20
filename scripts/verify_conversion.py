@@ -45,6 +45,8 @@ from oxe_lerobot.configs import get_config  # noqa: E402
 from oxe_lerobot.rlds_reader import iter_episodes  # noqa: E402
 from oxe_lerobot.transforms import (  # noqa: E402
     ACTION_FNS,
+    STATE_DELTA_KINDS,
+    _is_degenerate_pose,
     _quat_wxyz_to_euler_xyz,
     euler_xyz_to_quat_wxyz,
     finalize_actions_to_delta,
@@ -106,8 +108,20 @@ def _read_lerobot_ep(short_name: str, ep_index: int = 0) -> dict:
 def _read_rlds_first_episode(cfg) -> list[dict]:
     raw_dir = str(ROOT / "data" / "raw" / cfg.rlds_name / "0.1.0")
     for ep in iter_episodes(raw_dir, max_episodes=1):
-        return ep["steps"]
+        return _filter_raw_steps_for_state_delta(cfg, ep["steps"])
     raise RuntimeError(f"no episode in {raw_dir}")
+
+
+def _filter_raw_steps_for_state_delta(cfg, raw_steps: list[dict]) -> list[dict]:
+    """Mirror convert.py: for STATE_DELTA_KINDS datasets, drop raw RLDS steps
+    whose packed EE pose is degenerate (all-zero homogeneous matrix). This
+    keeps verification aligned with the parquet, which already excludes those
+    frames."""
+    if cfg.action_kind not in STATE_DELTA_KINDS:
+        return raw_steps
+    fn = ACTION_FNS[cfg.action_kind]
+    return [s for s in raw_steps
+            if not _is_degenerate_pose(fn(s, None))]
 
 
 # ---------------------------- ① numerical equivalence ---------------------------- #
@@ -132,20 +146,25 @@ def independent_expected_action(cfg, raw_steps: list[dict]) -> np.ndarray:
         out[n - 1, 6]  = raws[n - 1, 7]
         return out
 
-    if cfg.action_kind == "furniture_state_delta":
-        # furniture_bench: state-derived deltas.
-        states = np.stack(
-            [np.asarray(s["observation"]["state"], dtype=np.float64) for s in raw_steps]
-        )
-        n = len(states)
+    if cfg.action_kind in STATE_DELTA_KINDS:
+        # *_state_delta datasets: re-run the per-step pack fn to get packed
+        # [pos(3), quat_wxyz(4), grip(1)], then diff successive packed states.
+        # This mirrors what convert.py does: standardize_step + finalize.
+        fn = ACTION_FNS[cfg.action_kind]
+        packed = np.stack([fn(s, None) for s in raw_steps])  # (n, 8)
+        n = len(packed)
         out = np.zeros((n, 7), dtype=np.float32)
         for t in range(n - 1):
-            out[t, :3] = states[t + 1, :3] - states[t, :3]
-            q_rel = quat_relative_wxyz(states[t, 3:7], states[t + 1, 3:7])
+            if _is_degenerate_pose(packed[t]) or _is_degenerate_pose(packed[t + 1]):
+                out[t, :6] = 0.0
+                out[t, 6]  = packed[t, 7]
+                continue
+            out[t, :3] = packed[t + 1, :3] - packed[t, :3]
+            q_rel = quat_relative_wxyz(packed[t, 3:7], packed[t + 1, 3:7])
             out[t, 3:6] = _quat_wxyz_to_euler_xyz(q_rel)
-            out[t, 6]   = states[t, 34]
+            out[t, 6]   = packed[t, 7]
         out[n - 1, :6] = 0.0
-        out[n - 1, 6]  = states[n - 1, 34]
+        out[n - 1, 6]  = packed[n - 1, 7]
         return out
 
     if cfg.action_kind == "abs_euler_7d_to_delta":

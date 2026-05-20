@@ -14,10 +14,14 @@ Action conversion kinds:
                         Finalize converts to 7D delta with quat-relative rotation and
                         optional unit normalization (mm→m, deg→rad). Used by ucsd_kitchen.
   - "joint_vel_plus_delta": action is 15D, slice [7:13] (Δxyz, Δrpy) + [13] (gripper) → 7D.
-  - "furniture_state_delta": action derived from state EE pose; finalize pass computes
-                        delta from successive states. Bypasses the raw "quat velocity" field.
   - "delta_xyz_only_4d":    action is 4D [3 lin_vel, 1 gripper] — pad rotation with zeros.
   - "taco_rel_world":   pick action['rel_actions_world'] (7D) directly.
+  - "*_state_delta" family: action derived from state ΔEE pose. Per-step fn packs
+                        [pos(3), quat_wxyz(4), grip(1)] from the state observation; finalize
+                        diffs successive packed states (look-ahead). Used by furniture_bench,
+                        viola, stanford_hydra, austin_buds/sailor/sirius, utaustin_mutex —
+                        all datasets where the raw action field is a controller command
+                        whose magnitude differs from physical motion.
 
 FPS values come from each dataset's published source paper / OXE configs.
 """
@@ -50,10 +54,14 @@ DATASETS: dict[str, DatasetConfig] = {
         image_primary_key="agentview_rgb",
         image_wrist_key="eye_in_hand_rgb",
         state_key=None,  # synthesized: ee_states (homogeneous matrix) + gripper_states
-        action_kind="delta_7d_pack",
+        action_kind="viola_state_delta",
         language_key="natural_language_instruction",
         language_in_observation=True,
-        notes="action = world_vector(3)+rotation_delta(3)+gripper_closedness(1); state from ee_states+gripper_states",
+        notes="action derived from state ΔEE pose (ee_states[t+1]-ee_states[t]); "
+              "raw world_vector is a normalized OSC command (range ±1), ~100× larger "
+              "than physical motion, so we replace it with state-delta. Gripper from raw "
+              "action.gripper_closedness_action. Original command→state-delta scale "
+              "stored in info.json/action_metadata.",
     ),
     "stanford_hydra_dataset_converted_externally_to_rlds": DatasetConfig(
         name="stanford_hydra",
@@ -62,7 +70,10 @@ DATASETS: dict[str, DatasetConfig] = {
         image_primary_key="image",
         image_wrist_key="wrist_image",
         state_key="state",
-        action_kind="delta_7d",
+        action_kind="stanford_hydra_state_delta",
+        notes="action derived from state ΔEE pose (state[0:3] pos + state[3:7] quat_wxyz); "
+              "raw action is OSC command ~2× larger than physical motion. "
+              "Gripper from raw action[6]. Scale in info.json/action_metadata.",
     ),
     "austin_buds_dataset_converted_externally_to_rlds": DatasetConfig(
         name="austin_buds",
@@ -71,7 +82,9 @@ DATASETS: dict[str, DatasetConfig] = {
         image_primary_key="image",
         image_wrist_key="wrist_image",
         state_key="state",
-        action_kind="delta_7d",
+        action_kind="austin_buds_state_delta",
+        notes="action derived from state ΔEE pose (state[8:24] is 16D col-major homog matrix). "
+              "Gripper from raw action[6]. Scale in info.json/action_metadata.",
     ),
     "austin_sailor_dataset_converted_externally_to_rlds": DatasetConfig(
         name="austin_sailor",
@@ -80,7 +93,9 @@ DATASETS: dict[str, DatasetConfig] = {
         image_primary_key="image",
         image_wrist_key="wrist_image",
         state_key="state",
-        action_kind="delta_7d",
+        action_kind="austin_sailor_state_delta",
+        notes="action derived from obs.state_ee ΔEE pose (16D col-major homog matrix). "
+              "Gripper from raw action[6]. Scale in info.json/action_metadata.",
     ),
     "austin_sirius_dataset_converted_externally_to_rlds": DatasetConfig(
         name="austin_sirius",
@@ -89,7 +104,10 @@ DATASETS: dict[str, DatasetConfig] = {
         image_primary_key="image",
         image_wrist_key="wrist_image",
         state_key="state",
-        action_kind="delta_7d",
+        action_kind="austin_sirius_state_delta",
+        notes="action derived from obs.state_ee ΔEE pose. ~10 frames per episode have an "
+              "all-zero state_ee matrix (logging gap); finalize emits zero delta there. "
+              "Gripper from raw action[6]. Scale in info.json/action_metadata.",
     ),
     "utaustin_mutex": DatasetConfig(
         name="utaustin_mutex",
@@ -98,7 +116,9 @@ DATASETS: dict[str, DatasetConfig] = {
         image_primary_key="image",
         image_wrist_key="wrist_image",
         state_key="state",
-        action_kind="delta_7d",
+        action_kind="utaustin_mutex_state_delta",
+        notes="action derived from state ΔEE pose (state[8:24] is 16D col-major homog matrix). "
+              "Gripper from raw action[6]. Scale in info.json/action_metadata.",
     ),
     "furniture_bench_dataset_converted_externally_to_rlds": DatasetConfig(
         name="furniture_bench",

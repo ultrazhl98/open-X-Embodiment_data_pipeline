@@ -73,6 +73,55 @@ def euler_xyz_to_quat_wxyz(rpy: np.ndarray) -> np.ndarray:
     ], dtype=np.float64)
 
 
+def rotmat_to_quat_wxyz(R: np.ndarray) -> np.ndarray:
+    """3×3 rotation matrix → unit quaternion (w, x, y, z) via Shepperd's method.
+
+    Numerically stable: picks the largest of (1+tr, 1+R00-R11-R22, ...) as the
+    denominator so we never divide by ~0 when one component is near zero.
+    """
+    R = np.asarray(R, dtype=np.float64)
+    m00, m01, m02 = R[0, 0], R[0, 1], R[0, 2]
+    m10, m11, m12 = R[1, 0], R[1, 1], R[1, 2]
+    m20, m21, m22 = R[2, 0], R[2, 1], R[2, 2]
+    tr = m00 + m11 + m22
+    if tr > 0:
+        s = 2.0 * np.sqrt(tr + 1.0)
+        w = 0.25 * s
+        x = (m21 - m12) / s
+        y = (m02 - m20) / s
+        z = (m10 - m01) / s
+    elif (m00 > m11) and (m00 > m22):
+        s = 2.0 * np.sqrt(1.0 + m00 - m11 - m22)
+        w = (m21 - m12) / s
+        x = 0.25 * s
+        y = (m01 + m10) / s
+        z = (m02 + m20) / s
+    elif m11 > m22:
+        s = 2.0 * np.sqrt(1.0 + m11 - m00 - m22)
+        w = (m02 - m20) / s
+        x = (m01 + m10) / s
+        y = 0.25 * s
+        z = (m12 + m21) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + m22 - m00 - m11)
+        w = (m10 - m01) / s
+        x = (m02 + m20) / s
+        y = (m12 + m21) / s
+        z = 0.25 * s
+    return np.array([w, x, y, z], dtype=np.float64)
+
+
+def homogeneous16_to_pos_quat(mat16: np.ndarray, column_major: bool = True) -> np.ndarray:
+    """4x4 matrix flattened to 16 → (3 pos, 4 quat_wxyz). Column-major by default."""
+    m = np.asarray(mat16, dtype=np.float64).reshape(4, 4)
+    if column_major:
+        m = m.T
+    pos = m[:3, 3]
+    R = m[:3, :3]
+    q = rotmat_to_quat_wxyz(R)
+    return np.concatenate([pos, q]).astype(np.float64)
+
+
 def homogeneous16_to_pos_euler(mat16: np.ndarray, column_major: bool = True) -> np.ndarray:
     """4x4 matrix flattened to 16 → (3 pos, 3 euler).
 
@@ -159,6 +208,79 @@ def action_furniture_state_delta(step, prev_state) -> np.ndarray:
     return np.concatenate([ee_pos, ee_quat, grip]).astype(np.float32)
 
 
+def action_viola_state_delta(step, prev_state) -> np.ndarray:
+    """viola: pack [ee_pos(3), ee_quat_wxyz(4), gripper(1)]. Pose from
+    obs.ee_states (column-major 4×4); gripper from raw
+    action.gripper_closedness_action (the COMMAND, mirrors what we do for the
+    other *_state_delta datasets — gripper command is unaffected by OSC gain
+    issues so we keep the original command signal)."""
+    obs = step["observation"]
+    pos_quat = homogeneous16_to_pos_quat(obs["ee_states"], column_major=True)  # 7D
+    grip = _ensure_1d(step["action"]["gripper_closedness_action"])[:1]
+    return np.concatenate([pos_quat, grip]).astype(np.float32)
+
+
+def action_stanford_hydra_state_delta(step, prev_state) -> np.ndarray:
+    """stanford_hydra: state is 27D [pos(3), quat_wxyz(4), euler(3), 7 joint,
+    7 joint_vel, 3 gripper]. Pack [pos, quat, action[6]=gripper_close] — we use
+    the raw action's gripper command (not state) because the state's 3 gripper
+    channels are joint-level (finger positions), whereas action[6] is the
+    command. Finalize derives delta."""
+    obs = step["observation"]
+    state = _ensure_1d(obs["state"])
+    pos = state[0:3]
+    quat_wxyz = state[3:7]
+    raw_a = _ensure_1d(step["action"])
+    grip = raw_a[6:7]
+    return np.concatenate([pos, quat_wxyz, grip]).astype(np.float32)
+
+
+def action_state_homog_at_slice_state_delta(step, prev_state, slice_start: int = 8) -> np.ndarray:
+    """For austin_buds / utaustin_mutex: state is 24D [7 joint, 1 gripper, 16D
+    column-major homog matrix]. Pack [pos, quat_wxyz, action[6]=grip]."""
+    obs = step["observation"]
+    state = _ensure_1d(obs["state"])
+    mat16 = state[slice_start:slice_start + 16]
+    if np.linalg.norm(mat16) < 1e-6:
+        # degenerate frame — emit zeros; finalize will detect and emit zero delta
+        pos_quat = np.zeros(7, dtype=np.float64)
+    else:
+        pos_quat = homogeneous16_to_pos_quat(mat16, column_major=True)
+    raw_a = _ensure_1d(step["action"])
+    grip = raw_a[6:7]
+    return np.concatenate([pos_quat, grip]).astype(np.float32)
+
+
+def action_state_ee_field_state_delta(step, prev_state) -> np.ndarray:
+    """For austin_sailor / austin_sirius: obs.state_ee is 16D column-major homog
+    matrix. Pack [pos, quat_wxyz, action[6]=grip]."""
+    obs = step["observation"]
+    mat16 = _ensure_1d(obs["state_ee"])
+    if np.linalg.norm(mat16) < 1e-6:
+        pos_quat = np.zeros(7, dtype=np.float64)
+    else:
+        pos_quat = homogeneous16_to_pos_quat(mat16, column_major=True)
+    raw_a = _ensure_1d(step["action"])
+    grip = raw_a[6:7]
+    return np.concatenate([pos_quat, grip]).astype(np.float32)
+
+
+def action_austin_buds_state_delta(step, prev_state) -> np.ndarray:
+    return action_state_homog_at_slice_state_delta(step, prev_state, slice_start=8)
+
+
+def action_utaustin_mutex_state_delta(step, prev_state) -> np.ndarray:
+    return action_state_homog_at_slice_state_delta(step, prev_state, slice_start=8)
+
+
+def action_austin_sailor_state_delta(step, prev_state) -> np.ndarray:
+    return action_state_ee_field_state_delta(step, prev_state)
+
+
+def action_austin_sirius_state_delta(step, prev_state) -> np.ndarray:
+    return action_state_ee_field_state_delta(step, prev_state)
+
+
 def action_abs_euler_7d(step, prev_state) -> np.ndarray:
     # ucsd_kitchen / cmu_franka_exploration: 8D absolute [xyz, euler, grip, terminate]
     # → drop terminate, return 7D (treated as either absolute or already-delta per dataset notes)
@@ -199,6 +321,27 @@ ACTION_FNS = {
     "abs_euler_7d_to_delta":    action_abs_euler_7d,            # ucsd_kitchen: finalize does abs→delta
     "abs_quat_7d":              action_abs_quat_7d,
     "delta_xyz_only_4d":        action_delta_xyz_only_4d,
+    # State-derived deltas — per-step fn packs [pos(3), quat_wxyz(4), grip(1)];
+    # finalize diffs successive packed states (look-ahead).
+    "viola_state_delta":            action_viola_state_delta,
+    "stanford_hydra_state_delta":   action_stanford_hydra_state_delta,
+    "austin_buds_state_delta":      action_austin_buds_state_delta,
+    "utaustin_mutex_state_delta":   action_utaustin_mutex_state_delta,
+    "austin_sailor_state_delta":    action_austin_sailor_state_delta,
+    "austin_sirius_state_delta":    action_austin_sirius_state_delta,
+}
+
+
+# Action kinds whose per-step fn returns packed pose [pos(3), quat_wxyz(4), grip(1)]
+# and whose finalize is _finalize_via_state_delta.
+STATE_DELTA_KINDS = {
+    "furniture_state_delta",
+    "viola_state_delta",
+    "stanford_hydra_state_delta",
+    "austin_buds_state_delta",
+    "utaustin_mutex_state_delta",
+    "austin_sailor_state_delta",
+    "austin_sirius_state_delta",
 }
 
 
@@ -283,14 +426,24 @@ def _finalize_via_command_delta(canonical_steps: list[dict]) -> list[dict]:
     return out
 
 
+def _is_degenerate_pose(packed8: np.ndarray) -> bool:
+    """A packed [pos(3), quat(4), grip(1)] is degenerate if both pos and quat
+    are all-zero (some austin_sirius frames have an all-zero state_ee matrix)."""
+    return (np.linalg.norm(packed8[:3]) < 1e-6
+            and np.linalg.norm(packed8[3:7]) < 1e-6)
+
+
 def _finalize_via_state_delta(canonical_steps: list[dict]) -> list[dict]:
-    """For furniture_bench: each step's action is the packed
-    `[ee_pos, ee_quat_wxyz, gripper_width]` from the state observation.
-    Compute 7D delta to the NEXT state (not previous) — i.e. action[t] is
-    the motion that takes state[t] → state[t+1]. This is the standard
-    OXE/Octo convention.
+    """For furniture_bench / *_state_delta datasets: each step's action is the
+    packed `[ee_pos, ee_quat_wxyz, gripper]` from the state observation.
+    Compute 7D delta to the NEXT state (not previous) — i.e. action[t] is the
+    motion that takes state[t] → state[t+1]. This is the standard OXE/Octo
+    convention.
 
     Last frame has no next state → emit zero delta + current gripper.
+    Robust to degenerate (all-zero) pose entries: emits zero delta if either
+    the current or next packed pose is degenerate (only seen in austin_sirius
+    and austin_buds; corresponds to missing state_ee logging frames).
     """
     n = len(canonical_steps)
     out = []
@@ -301,10 +454,14 @@ def _finalize_via_state_delta(canonical_steps: list[dict]) -> list[dict]:
             delta[6] = float(raw[7])
         else:
             nxt = np.asarray(canonical_steps[t + 1]["action"], dtype=np.float64)
-            dxyz = nxt[:3] - raw[:3]
-            q_rel = quat_relative_wxyz(raw[3:7], nxt[3:7])
-            drpy = _quat_wxyz_to_euler_xyz(q_rel)
-            delta = np.concatenate([dxyz, drpy, [raw[7]]]).astype(np.float32)
+            if _is_degenerate_pose(raw) or _is_degenerate_pose(nxt):
+                delta = np.zeros(7, dtype=np.float32)
+                delta[6] = float(raw[7])
+            else:
+                dxyz = nxt[:3] - raw[:3]
+                q_rel = quat_relative_wxyz(raw[3:7], nxt[3:7])
+                drpy = _quat_wxyz_to_euler_xyz(q_rel)
+                delta = np.concatenate([dxyz, drpy, [raw[7]]]).astype(np.float32)
         out.append({**s, "action": delta})
     return out
 
@@ -360,10 +517,10 @@ def finalize_actions_to_delta(canonical_steps: list[dict], cfg) -> list[dict]:
     """Second pass to compute the final 7D delta action for datasets whose
     per-step `action_fn` only emitted an intermediate (raw target pose or
     packed state). No-op for already-delta kinds."""
+    if cfg.action_kind in STATE_DELTA_KINDS:
+        return _finalize_via_state_delta(canonical_steps)
     if cfg.action_kind == "abs_quat_7d":
         return _finalize_via_command_delta(canonical_steps)
-    if cfg.action_kind == "furniture_state_delta":
-        return _finalize_via_state_delta(canonical_steps)
     if cfg.action_kind == "abs_euler_7d_to_delta":
         # ucsd_kitchen: 8D abs [xyz(mm), euler(deg), grip, terminate] → 7D delta in SI units.
         return _finalize_via_euler_to_delta(canonical_steps,

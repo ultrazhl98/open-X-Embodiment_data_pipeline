@@ -134,6 +134,16 @@ class LeRobotV2Writer:
         }
         self._global_index = 0
         self._image_shapes: dict[str, tuple[int, int, int]] = {}
+        # Optional dataset-level action metadata embedded in info.json. Lets the
+        # converter record e.g. "action_semantics = physical_delta" and the
+        # raw-command→state-delta scale per axis for state-derived datasets.
+        self._action_metadata: dict | None = None
+
+    # -- action metadata ---------------------------------------------------
+    def set_action_metadata(self, metadata: dict) -> None:
+        """Attach a dict of action-level metadata to be written into info.json.
+        Typically `{action_semantics, action_metadata: {...}}`."""
+        self._action_metadata = dict(metadata)
 
     # -- task table ---------------------------------------------------------
     def _task_index(self, task: str) -> int:
@@ -293,6 +303,8 @@ class LeRobotV2Writer:
             "features": features,
             "repo_id": self.repo_id,
         }
+        if self._action_metadata is not None:
+            info.update(self._action_metadata)
         with open(meta / "info.json", "w") as f:
             json.dump(info, f, indent=2)
 
