@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import sys
 from pathlib import Path
@@ -434,7 +435,9 @@ def animate_trajectory_with_frame(ee_xyz: np.ndarray,
                                   indices: list[int] | None = None,
                                   target_frames: int = 60,
                                   fps: int = 10) -> str:
-    """Animated GIF: growing 3D trajectory + EE coordinate frame (x=R, y=G, z=B)."""
+    """Animated GIF: growing 3D trajectory + EE coordinate frame (x=R, y=G, z=B).
+    Kept alongside the interactive Plotly version so the GIF can be placed next to
+    the video GIF and play in sync at the same fps for visual comparison."""
     n = len(ee_xyz)
     idx = indices if indices is not None else _downsample_indices(n, target_frames)
 
@@ -468,7 +471,6 @@ def animate_trajectory_with_frame(ee_xyz: np.ndarray,
         ax.set_title(f"{title}\nframe {i}/{n - 1}  (red=EE x, green=EE y, blue=EE z)")
 
     anim = FuncAnimation(fig, update, frames=len(idx), interval=1000 / fps, blit=False)
-    # matplotlib's anim.save needs a file path, not a BytesIO — use a temp file.
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
         tmp_path = tmp.name
@@ -480,6 +482,140 @@ def animate_trajectory_with_frame(ee_xyz: np.ndarray,
         plt.close(fig)
         os.unlink(tmp_path)
     return base64.b64encode(data).decode()
+
+
+def build_plotly_traj_anim(ee_xyz: np.ndarray,
+                           R_per_frame: np.ndarray,
+                           title: str,
+                           indices: list[int] | None = None,
+                           target_frames: int = 60,
+                           fps: int = 8) -> dict:
+    """Build a Plotly figure spec ({data, layout, frames}) for an interactive 3D
+    trajectory animation. The user can drag to rotate, scroll to zoom, and use
+    the play button / slider to scrub through frames.
+
+    Traces:
+      0: full trajectory (static gray background, helps orient while rotating)
+      1: active trajectory up to current frame (animated, blue)
+      2: current EE position marker (animated, red)
+      3-5: EE coordinate axes x/y/z (animated, red/green/blue)
+      6: start marker (static, green)
+    """
+    n = len(ee_xyz)
+    idx = indices if indices is not None else _downsample_indices(n, target_frames)
+
+    mins = ee_xyz.min(axis=0)
+    maxs = ee_xyz.max(axis=0)
+    center = (mins + maxs) / 2
+    half_range = max(((maxs - mins).max() / 2) * 1.25, 0.05)
+    axis_len = float(half_range * 0.18)
+
+    def axis_segment(origin: np.ndarray, R: np.ndarray, col: int) -> dict:
+        end = origin + R[:, col] * axis_len
+        return {"x": [float(origin[0]), float(end[0])],
+                "y": [float(origin[1]), float(end[1])],
+                "z": [float(origin[2]), float(end[2])]}
+
+    frames = []
+    for k, i in enumerate(idx):
+        origin = ee_xyz[i]
+        R = R_per_frame[i]
+        frames.append({
+            "name": str(k),
+            "data": [
+                {"x": ee_xyz[: i + 1, 0].tolist(),
+                 "y": ee_xyz[: i + 1, 1].tolist(),
+                 "z": ee_xyz[: i + 1, 2].tolist()},
+                {"x": [float(origin[0])],
+                 "y": [float(origin[1])],
+                 "z": [float(origin[2])]},
+                axis_segment(origin, R, 0),
+                axis_segment(origin, R, 1),
+                axis_segment(origin, R, 2),
+            ],
+            "traces": [1, 2, 3, 4, 5],
+            "layout": {"title": {"text": f"{title}<br><sub>frame {i}/{n - 1}</sub>"}},
+        })
+
+    i0 = idx[0]
+    origin0 = ee_xyz[i0]
+    R0 = R_per_frame[i0]
+
+    data = [
+        {"type": "scatter3d", "mode": "lines",
+         "x": ee_xyz[:, 0].tolist(),
+         "y": ee_xyz[:, 1].tolist(),
+         "z": ee_xyz[:, 2].tolist(),
+         "line": {"color": "rgba(120,120,120,0.30)", "width": 2},
+         "name": "full trajectory", "hoverinfo": "skip"},
+        {"type": "scatter3d", "mode": "lines",
+         "x": ee_xyz[: i0 + 1, 0].tolist(),
+         "y": ee_xyz[: i0 + 1, 1].tolist(),
+         "z": ee_xyz[: i0 + 1, 2].tolist(),
+         "line": {"color": "#1f77b4", "width": 4},
+         "name": "trajectory"},
+        {"type": "scatter3d", "mode": "markers",
+         "x": [float(origin0[0])], "y": [float(origin0[1])], "z": [float(origin0[2])],
+         "marker": {"color": "red", "size": 5},
+         "name": "current"},
+        {"type": "scatter3d", "mode": "lines",
+         **axis_segment(origin0, R0, 0),
+         "line": {"color": "#d62728", "width": 6},
+         "name": "EE x", "hoverinfo": "skip"},
+        {"type": "scatter3d", "mode": "lines",
+         **axis_segment(origin0, R0, 1),
+         "line": {"color": "#2ca02c", "width": 6},
+         "name": "EE y", "hoverinfo": "skip"},
+        {"type": "scatter3d", "mode": "lines",
+         **axis_segment(origin0, R0, 2),
+         "line": {"color": "#1f77b4", "width": 6},
+         "name": "EE z", "hoverinfo": "skip"},
+        {"type": "scatter3d", "mode": "markers",
+         "x": [float(ee_xyz[0, 0])], "y": [float(ee_xyz[0, 1])], "z": [float(ee_xyz[0, 2])],
+         "marker": {"color": "green", "size": 5},
+         "name": "start"},
+    ]
+
+    frame_ms = int(1000 / fps)
+    play_args = [None, {"frame": {"duration": frame_ms, "redraw": True},
+                        "fromcurrent": True, "transition": {"duration": 0}}]
+    pause_args = [[None], {"frame": {"duration": 0, "redraw": False},
+                           "mode": "immediate", "transition": {"duration": 0}}]
+    slider_steps = [{"label": str(k), "method": "animate",
+                     "args": [[str(k)], {"frame": {"duration": 0, "redraw": True},
+                                          "mode": "immediate",
+                                          "transition": {"duration": 0}}]}
+                    for k in range(len(idx))]
+
+    layout = {
+        "title": {"text": f"{title}<br><sub>frame {i0}/{n - 1}</sub>"},
+        "scene": {
+            "xaxis": {"range": [float(center[0] - half_range), float(center[0] + half_range)], "title": "x"},
+            "yaxis": {"range": [float(center[1] - half_range), float(center[1] + half_range)], "title": "y"},
+            "zaxis": {"range": [float(center[2] - half_range), float(center[2] + half_range)], "title": "z"},
+            "aspectmode": "cube",
+        },
+        "margin": {"l": 0, "r": 0, "t": 60, "b": 0},
+        "showlegend": False,
+        "height": 500,
+        "updatemenus": [{
+            "type": "buttons", "direction": "left",
+            "x": 0.05, "y": -0.05, "xanchor": "left", "yanchor": "top",
+            "pad": {"t": 0, "r": 8},
+            "buttons": [
+                {"label": "▶ Play",  "method": "animate", "args": play_args},
+                {"label": "⏸ Pause", "method": "animate", "args": pause_args},
+            ],
+        }],
+        "sliders": [{
+            "active": 0, "x": 0.18, "y": -0.05, "len": 0.78,
+            "xanchor": "left", "yanchor": "top",
+            "currentvalue": {"prefix": "frame index: ", "font": {"size": 12}},
+            "steps": slider_steps,
+        }],
+    }
+
+    return {"data": data, "layout": layout, "frames": frames}
 
 
 def integrated_xyz(action: np.ndarray, start_xyz: np.ndarray) -> np.ndarray:
@@ -547,6 +683,7 @@ def verify_one(short_name: str) -> dict:
     # ② correlation w/ EE velocity
     ee_xyz = extract_ee_xyz(cfg, lerobot["state"], raw_steps)
     corr = scatter_b64 = traj_b64 = traj_anim_b64 = None
+    traj_anim_plotly = None
     if ee_xyz is not None and len(ee_xyz) >= 3:
         corr = correlation_per_axis(lerobot["action"], ee_xyz)
         scatter_b64 = plot_action_vs_velocity(
@@ -556,15 +693,21 @@ def verify_one(short_name: str) -> dict:
         traj_b64 = plot_trajectory_3d(
             ee_xyz, f"{cfg.name}: EE trajectory (solid=state, dashed=∑action+x₀)", integ
         )
-        # animated 3D trajectory + EE coordinate frame (for visual comparison with the video)
+        # animated 3D trajectory + EE coordinate frame — two flavors:
+        #   GIF: plays in sync with the video GIF (same indices + fps) for hand-eye
+        #        verification of the reconstructed EE pose against the video.
+        #   Plotly: same data but interactive (drag to rotate, slider to scrub).
         R_per_frame = extract_rotations(cfg, lerobot["state"], raw_steps)
-        # Pick a common frame index list so the video GIF and the trajectory animation
-        # play in sync — useful for visual comparison.
         common_indices = _downsample_indices(eq["n_frames"], target=50)
         shared_fps = 8
         if R_per_frame is not None:
-            print("  rendering 3D trajectory animation…", flush=True)
+            print("  rendering 3D trajectory animation (GIF + interactive)…", flush=True)
             traj_anim_b64 = animate_trajectory_with_frame(
+                ee_xyz, R_per_frame,
+                title=f"{cfg.name}: animated EE pose",
+                indices=common_indices, fps=shared_fps,
+            )
+            traj_anim_plotly = build_plotly_traj_anim(
                 ee_xyz, R_per_frame,
                 title=f"{cfg.name}: animated EE pose",
                 indices=common_indices, fps=shared_fps,
@@ -588,11 +731,12 @@ def verify_one(short_name: str) -> dict:
         "n_frames":       eq["n_frames"],
         "equivalence":    eq,
         "correlation":    corr,
-        "scatter_b64":    scatter_b64,
-        "traj_b64":       traj_b64,
-        "traj_anim_b64":  traj_anim_b64,
-        "ts_b64":         ts_b64,
-        "gif_b64":        gif_b64,
+        "scatter_b64":       scatter_b64,
+        "traj_b64":          traj_b64,
+        "traj_anim_b64":     traj_anim_b64,
+        "traj_anim_plotly":  traj_anim_plotly,
+        "ts_b64":            ts_b64,
+        "gif_b64":           gif_b64,
     }
 
 
@@ -635,9 +779,12 @@ def _r_cls(r: float) -> str:
 def render_html(results: list[dict], out_path: Path) -> None:
     parts = ["<!doctype html><html><head><meta charset='utf-8'>",
              "<title>OXE → LeRobot v2 验证报告</title>",
+             # Plotly.js for interactive 3D trajectory views (drag to rotate, scroll to zoom)
+             "<script src='https://cdn.plot.ly/plotly-2.35.2.min.js' charset='utf-8'></script>",
              f"<style>{CSS}</style></head><body>",
              "<h1>OXE → LeRobot v2 转换验证报告</h1>",
-             "<p>每个数据集跑 4 项检查：① 数值一致性 ② action 与 EE 速度相关性 ③ 时序图 ④ 视频回放。</p>"]
+             "<p>每个数据集跑 4 项检查：① 数值一致性 ② action 与 EE 速度相关性 ③ 时序图 ④ 视频回放。</p>",
+             "<p class='muted'>提示：④ 中上方是与视频同步播放的 GIF（便于对比），下方的交互式 3D 视图支持鼠标拖拽旋转、滚轮缩放，可暂停在任意帧从不同角度查看。</p>"]
 
     for r in results:
         parts.append(f"<h2>{r['name']} &nbsp;<code>{r['action_kind']}</code></h2>")
@@ -678,10 +825,9 @@ def render_html(results: list[dict], out_path: Path) -> None:
             parts.append("<h3>③ 末端轨迹 3D 视图（全程）</h3>")
             parts.append(f"<img src='data:image/png;base64,{r['traj_b64']}'>")
 
-        # Side-by-side: video playback + animated trajectory with EE frame.
-        # Both use the same frame indices + fps, so they play in sync.
-        parts.append("<h3>④ 视频回放  ↔  末端轨迹 + 姿态动画（同步播放）</h3>")
-        parts.append("<p class='muted'>左边是 primary + wrist 相机视频，右边是 EE 位置（蓝线）+ 末端坐标系（红=x，绿=y，蓝=z）。两段动画使用相同的帧索引和 fps，可以同时观察「视频里 gripper 的位置朝向」和「我们重构出的 EE 位姿」是否一致。</p>")
+        # ④ video + synced trajectory GIF (top row), interactive Plotly (below).
+        parts.append("<h3>④ 视频回放  ↔  末端轨迹 + 姿态动画（同步播放 + 可拖拽旋转）</h3>")
+        parts.append("<p class='muted'>上方左右两个 GIF 使用相同帧索引和 fps 同步播放：左是 primary + wrist 相机视频，右是 EE 位置（蓝线）+ 末端坐标系（红=x，绿=y，蓝=z），用来对比「视频里 gripper 的位置朝向」和「重构出的 EE 位姿」是否一致。下方是同一段数据的交互式 3D 视图——鼠标拖拽旋转，滚轮缩放，▶ 播放或拖动滑块查看任意帧。</p>")
         parts.append("<div class='side-by-side'>")
         parts.append("<figure>"
                      f"<img src='data:image/gif;base64,{r['gif_b64']}'>"
@@ -690,9 +836,27 @@ def render_html(results: list[dict], out_path: Path) -> None:
         if r.get("traj_anim_b64"):
             parts.append("<figure>"
                          f"<img src='data:image/gif;base64,{r['traj_anim_b64']}'>"
-                         "<figcaption>EE 位置 + 姿态坐标系</figcaption>"
+                         "<figcaption>EE 位置 + 姿态坐标系（GIF，与视频同步）</figcaption>"
                          "</figure>")
         parts.append("</div>")
+        if r.get("traj_anim_plotly"):
+            div_id = f"traj-anim-{r['name']}"
+            json_id = f"traj-anim-json-{r['name']}"
+            fig_json = json.dumps(r["traj_anim_plotly"])
+            parts.append(
+                "<figure style='margin:12px 0 0;'>"
+                f"<div id='{div_id}' style='width:100%;height:560px;'></div>"
+                # Embed the figure spec as JSON in a script tag — sidesteps escaping
+                # issues that come up with inline JS strings containing quotes.
+                f"<script type='application/json' id='{json_id}'>{fig_json}</script>"
+                "<script>(function(){"
+                f"var fig=JSON.parse(document.getElementById('{json_id}').textContent);"
+                f"Plotly.newPlot('{div_id}',fig.data,fig.layout,{{responsive:true,displaylogo:false}})"
+                f".then(function(){{Plotly.addFrames('{div_id}',fig.frames);}});"
+                "})();</script>"
+                "<figcaption>EE 位置 + 姿态坐标系（交互式：拖拽旋转，滑块定格）</figcaption>"
+                "</figure>"
+            )
 
         # time series
         parts.append("<h3>⑤ Action 7 通道时序</h3>")
