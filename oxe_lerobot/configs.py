@@ -171,8 +171,12 @@ DATASETS: dict[str, DatasetConfig] = {
         image_wrist_key=None,
         image_secondary_key="image_additional_view",
         state_key="state",
-        action_kind="joint_vel_plus_delta",
-        notes="no wrist; secondary 'image_additional_view' kept as image_secondary",
+        action_kind="nyu_state_delta",
+        notes="no wrist; secondary 'image_additional_view' kept as image_secondary. "
+              "Rotation derived from state EE pose (quat-relative), NOT the raw "
+              "command Δrpy: the command is a per-component euler difference, which "
+              "is not the true relative rotation and drifts a few degrees (verified "
+              "via rotation round-trip). Gripper still from the raw command a[13].",
     ),
     "ucsd_kitchen_dataset_converted_externally_to_rlds": DatasetConfig(
         name="ucsd_kitchen",
@@ -193,8 +197,12 @@ DATASETS: dict[str, DatasetConfig] = {
         image_primary_key="image",
         image_wrist_key=None,
         state_key="state",
-        action_kind="delta_xyz_only_4d",
-        notes="action is only 4D (3 lin_vel + gripper); rotation channels zero-padded",
+        action_kind="ucsd_pick_state_delta",
+        notes="raw action is a normalized gripper velocity command (3 lin_vel "
+              "clipped to ±1 + gripper torque) that can't be integrated to the EE "
+              "path. Derive the 7D delta from successive state EE poses instead "
+              "(state = [pos(3), euler(3), finger(1)]); gripper = raw torque cmd. "
+              "Same unit-consistency fix as taco_play / nyu_franka_play.",
     ),
     "cmu_franka_exploration_dataset_converted_externally_to_rlds": DatasetConfig(
         name="cmu_franka_exploration",

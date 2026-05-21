@@ -311,6 +311,75 @@ def plot_action_vs_velocity(action: np.ndarray, ee_xyz: np.ndarray, title: str) 
     return _fig_to_b64(fig)
 
 
+# ---------------------------- ⑥ rotation round-trip ---------------------------- #
+
+def _is_valid_R(R: np.ndarray) -> bool:
+    """A 3×3 is a usable rotation if it's finite, non-degenerate, and has det≈1.
+    Filters out the all-zero homogeneous-matrix frames (austin_buds/sirius) and
+    any NaN orientation before they pollute the geodesic-error stats."""
+    if not np.isfinite(R).all():
+        return False
+    if np.linalg.norm(R) < 1e-6:
+        return False
+    return abs(float(np.linalg.det(R)) - 1.0) < 1e-2
+
+
+def rotation_roundtrip(action: np.ndarray, R_per_frame: np.ndarray) -> dict | None:
+    """Independent numerical check of the axis-angle rotation channel.
+
+    `action[t, 3:6]` is the world-frame relative rotation taking the EE
+    orientation R_t → R_{t+1} (pipeline convention: q_rel = q_{t+1}·q_t⁻¹, i.e.
+    R_{t+1} = R_rel · R_t — left/world multiply). We reconstruct R_{t+1} from
+    R_t + action using **scipy** — an implementation of the rotvec→matrix math
+    that is independent of the pipeline's hand-rolled `_quat_wxyz_to_rotvec` —
+    and measure the geodesic angle between predicted and actual next orientation.
+
+    Because R_per_frame comes straight from the *state* (quat/euler/4×4 matrix)
+    while the rotvec went through the action path, a near-zero error proves the
+    rotvec math, the frame convention (axis order, multiply side, sign), and the
+    state↔action orientation sources are all mutually consistent. A non-trivial
+    error pinpoints exactly which of those is wrong.
+
+    Returns None if no valid orientation is available (e.g. cmu_franka_exploration).
+    """
+    from scipy.spatial.transform import Rotation as Rsp
+
+    if R_per_frame is None:
+        return None
+    n = min(len(action), len(R_per_frame))
+    errs_deg = np.full(n, np.nan, dtype=np.float64)   # full length for plotting
+    for t in range(n - 1):
+        R_t, R_next = R_per_frame[t], R_per_frame[t + 1]
+        if not (_is_valid_R(R_t) and _is_valid_R(R_next)):
+            continue
+        R_rel = Rsp.from_rotvec(np.asarray(action[t, 3:6], dtype=np.float64)).as_matrix()
+        R_pred = R_rel @ R_t                          # world-frame left multiply
+        ang = Rsp.from_matrix(R_pred @ R_next.T).magnitude()  # geodesic angle (rad)
+        errs_deg[t] = np.degrees(ang)
+
+    valid = errs_deg[np.isfinite(errs_deg)]
+    if len(valid) == 0:
+        return None
+    return {
+        "n_valid":   int(len(valid)),
+        "mean_deg":  float(valid.mean()),
+        "median_deg": float(np.median(valid)),
+        "p99_deg":   float(np.percentile(valid, 99)),
+        "max_deg":   float(valid.max()),
+        "errs_deg":  errs_deg,                         # per-frame, NaN where skipped
+    }
+
+
+def plot_rotation_error(errs_deg: np.ndarray, title: str) -> str:
+    fig, ax = plt.subplots(figsize=(9, 2.6))
+    ax.plot(errs_deg, linewidth=1, color="#9467bd")
+    ax.set_ylabel("geodesic\nerror (deg)")
+    ax.set_xlabel("frame")
+    ax.grid(alpha=0.3)
+    fig.suptitle(title)
+    return _fig_to_b64(fig)
+
+
 # ---------------------------- ③ time-series + 3D trajectory ---------------------------- #
 
 def plot_action_timeseries(action: np.ndarray, title: str) -> str:
@@ -439,13 +508,43 @@ def _downsample_indices(n: int, target: int = 40) -> list[int]:
     return [int(i * (n - 1) / (target - 1)) for i in range(target)]
 
 
+def _rotvec_arrow_scale(action_rotvec: np.ndarray | None, ref_len: float,
+                        pct: float = 90.0) -> float:
+    """Scale factor mapping a *reference* per-step |rotvec| (rad) to `ref_len`
+    (scene units). We normalize against the `pct`-th percentile rather than the
+    max so the typical-frame arrow is long enough to be legible: most datasets
+    have a heavily right-skewed rotation distribution (p50 ≪ max), and dividing
+    by max squashes nearly every frame to ~10% length. Peak frames are allowed
+    to exceed `ref_len` and get clipped at draw time (see `_scaled_rotvec`)."""
+    if action_rotvec is None:
+        return 0.0
+    mags = np.linalg.norm(action_rotvec, axis=1)
+    ref = float(np.percentile(mags, pct))
+    if ref <= 1e-9:                       # near-degenerate p90 → fall back to max
+        ref = float(mags.max())
+    return ref_len / ref if ref > 1e-9 else 0.0
+
+
+def _scaled_rotvec(rv: np.ndarray, rot_scale: float, max_visual: float) -> np.ndarray:
+    """Scale a raw rotvec to scene units, clipping its length to `max_visual`
+    (keeps peak-frame arrows from shooting off-screen while preserving direction)."""
+    vec = np.asarray(rv, dtype=np.float64) * rot_scale
+    L = float(np.linalg.norm(vec))
+    if L > max_visual > 0.0:
+        vec = vec * (max_visual / L)
+    return vec
+
+
 def animate_trajectory_with_frame(ee_xyz: np.ndarray,
                                   R_per_frame: np.ndarray,
                                   title: str,
                                   indices: list[int] | None = None,
                                   target_frames: int = 60,
-                                  fps: int = 10) -> str:
-    """Animated GIF: growing 3D trajectory + EE coordinate frame (x=R, y=G, z=B).
+                                  fps: int = 10,
+                                  action_rotvec: np.ndarray | None = None) -> str:
+    """Animated GIF: growing 3D trajectory + EE coordinate frame (x=R, y=G, z=B),
+    plus the per-step action axis-angle (rotvec) as a magenta arrow from the EE
+    (direction = world-frame rotation axis, length ∝ rotation angle this step).
     Kept alongside the interactive Plotly version so the GIF can be placed next to
     the video GIF and play in sync at the same fps for visual comparison."""
     n = len(ee_xyz)
@@ -459,6 +558,9 @@ def animate_trajectory_with_frame(ee_xyz: np.ndarray,
     center = (mins + maxs) / 2
     half_range = max(((maxs - mins).max() / 2) * 1.25, 0.05)
     axis_len = half_range * 0.18
+    rot_ref_len = half_range * 0.45        # p90-frame arrow length (≫ EE triad, legible)
+    rot_max_visual = half_range * 0.65     # clip peak frames so they stay on-screen
+    rot_scale = _rotvec_arrow_scale(action_rotvec, rot_ref_len)
 
     def update(k):
         ax.clear()
@@ -474,11 +576,18 @@ def animate_trajectory_with_frame(ee_xyz: np.ndarray,
             ax.quiver(origin[0], origin[1], origin[2],
                       vec[0], vec[1], vec[2],
                       color=color, linewidth=2.5, arrow_length_ratio=0.25)
+        if rot_scale > 0.0 and i < len(action_rotvec):
+            rv = _scaled_rotvec(action_rotvec[i], rot_scale, rot_max_visual)
+            if np.linalg.norm(rv) > 1e-9:
+                ax.quiver(origin[0], origin[1], origin[2],
+                          rv[0], rv[1], rv[2],
+                          color="#e377c2", linewidth=3.0, arrow_length_ratio=0.3)
         ax.set_xlim(center[0] - half_range, center[0] + half_range)
         ax.set_ylim(center[1] - half_range, center[1] + half_range)
         ax.set_zlim(center[2] - half_range, center[2] + half_range)
         ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
-        ax.set_title(f"{title}\nframe {i}/{n - 1}  (red=EE x, green=EE y, blue=EE z)")
+        ax.set_title(f"{title}\nframe {i}/{n - 1}  (EE: red=x green=y blue=z; "
+                     f"magenta=action rotvec)")
 
     anim = FuncAnimation(fig, update, frames=len(idx), interval=1000 / fps, blit=False)
     import tempfile
@@ -499,7 +608,8 @@ def build_plotly_traj_anim(ee_xyz: np.ndarray,
                            title: str,
                            indices: list[int] | None = None,
                            target_frames: int = 60,
-                           fps: int = 8) -> dict:
+                           fps: int = 8,
+                           action_rotvec: np.ndarray | None = None) -> dict:
     """Build a Plotly figure spec ({data, layout, frames}) for an interactive 3D
     trajectory animation. The user can drag to rotate, scroll to zoom, and use
     the play button / slider to scrub through frames.
@@ -509,7 +619,9 @@ def build_plotly_traj_anim(ee_xyz: np.ndarray,
       1: active trajectory up to current frame (animated, blue)
       2: current EE position marker (animated, red)
       3-5: EE coordinate axes x/y/z (animated, red/green/blue)
-      6: start marker (static, green)
+      6: action rotvec arrow line (animated, magenta)
+      7: action rotvec arrow head cone (animated, magenta)
+      8: start marker (static, green)
     """
     n = len(ee_xyz)
     idx = indices if indices is not None else _downsample_indices(n, target_frames)
@@ -521,12 +633,35 @@ def build_plotly_traj_anim(ee_xyz: np.ndarray,
     half_range = max(((maxs - mins).max() / 2) * 1.25, 0.05)
     axis_len = float(half_range * 0.18)
     world_axis_len = float(half_range * 0.30)
+    rot_ref_len = float(half_range * 0.45)     # p90-frame arrow length (≫ EE triad)
+    rot_max_visual = float(half_range * 0.65)  # clip peak frames so they stay on-screen
+    rot_scale = _rotvec_arrow_scale(action_rotvec, rot_ref_len)
+    rot_cone_ref = float(half_range * 0.12)
 
     def axis_segment(origin: np.ndarray, R: np.ndarray, col: int) -> dict:
         end = origin + R[:, col] * axis_len
         return {"x": [float(origin[0]), float(end[0])],
                 "y": [float(origin[1]), float(end[1])],
                 "z": [float(origin[2]), float(end[2])]}
+
+    def _rv_end_dir(i: int) -> tuple[np.ndarray, np.ndarray]:
+        """Clipped scene-unit rotvec vector for frame i (zeros if unavailable)."""
+        if rot_scale > 0.0 and i < len(action_rotvec):
+            return _scaled_rotvec(action_rotvec[i], rot_scale, rot_max_visual), action_rotvec[i]
+        return np.zeros(3), np.zeros(3)
+
+    def rotvec_line(origin: np.ndarray, i: int) -> dict:
+        vec, _ = _rv_end_dir(i)
+        end = origin + vec
+        return {"x": [float(origin[0]), float(end[0])],
+                "y": [float(origin[1]), float(end[1])],
+                "z": [float(origin[2]), float(end[2])]}
+
+    def rotvec_cone(origin: np.ndarray, i: int) -> dict:
+        vec, rv = _rv_end_dir(i)
+        end = origin + vec
+        return {"x": [float(end[0])], "y": [float(end[1])], "z": [float(end[2])],
+                "u": [float(rv[0])], "v": [float(rv[1])], "w": [float(rv[2])]}
 
     frames = []
     for k, i in enumerate(idx):
@@ -544,8 +679,10 @@ def build_plotly_traj_anim(ee_xyz: np.ndarray,
                 axis_segment(origin, R, 0),
                 axis_segment(origin, R, 1),
                 axis_segment(origin, R, 2),
+                rotvec_line(origin, i),
+                rotvec_cone(origin, i),
             ],
-            "traces": [1, 2, 3, 4, 5],
+            "traces": [1, 2, 3, 4, 5, 6, 7],
             "layout": {"title": {"text": f"{title}<br><sub>frame {i}/{n - 1}</sub>"}},
         })
 
@@ -582,6 +719,16 @@ def build_plotly_traj_anim(ee_xyz: np.ndarray,
          **axis_segment(origin0, R0, 2),
          "line": {"color": "#1f77b4", "width": 6},
          "name": "EE z", "hoverinfo": "skip"},
+        {"type": "scatter3d", "mode": "lines",
+         **rotvec_line(origin0, i0),
+         "line": {"color": "#e377c2", "width": 7},
+         "name": "action rotvec", "hoverinfo": "skip"},
+        {"type": "cone",
+         **rotvec_cone(origin0, i0),
+         "sizemode": "absolute", "sizeref": rot_cone_ref,
+         "anchor": "tip", "showscale": False,
+         "colorscale": [[0, "#e377c2"], [1, "#e377c2"]],
+         "hoverinfo": "skip", "showlegend": False},
         {"type": "scatter3d", "mode": "markers",
          "x": [float(ee_xyz[0, 0])], "y": [float(ee_xyz[0, 1])], "z": [float(ee_xyz[0, 2])],
          "marker": {"color": "green", "size": 5},
@@ -721,6 +868,18 @@ def verify_one(short_name: str) -> dict:
     # ① numerical equivalence
     eq = numerical_equivalence(cfg, raw_steps, lerobot["action"])
 
+    # EE orientation per frame (from state) — reused by ⑥ round-trip and the animation.
+    R_per_frame = extract_rotations(cfg, lerobot["state"], raw_steps)
+
+    # ⑥ rotation round-trip: reconstruct R_{t+1} from R_t + action via scipy.
+    rot_rt = rotation_roundtrip(lerobot["action"], R_per_frame)
+    rot_rt_b64 = None
+    if rot_rt is not None:
+        rot_rt_b64 = plot_rotation_error(
+            rot_rt["errs_deg"],
+            f"{cfg.name}: rotation round-trip geodesic error (deg)",
+        )
+
     # ② correlation w/ EE velocity
     ee_xyz = extract_ee_xyz(cfg, lerobot["state"], raw_steps)
     corr = scatter_b64 = traj_b64 = traj_anim_b64 = None
@@ -738,20 +897,22 @@ def verify_one(short_name: str) -> dict:
         #   GIF: plays in sync with the video GIF (same indices + fps) for hand-eye
         #        verification of the reconstructed EE pose against the video.
         #   Plotly: same data but interactive (drag to rotate, slider to scrub).
-        R_per_frame = extract_rotations(cfg, lerobot["state"], raw_steps)
         common_indices = _downsample_indices(eq["n_frames"], target=50)
         shared_fps = 8
         if R_per_frame is not None:
             print("  rendering 3D trajectory animation (GIF + interactive)…", flush=True)
+            action_rotvec = lerobot["action"][:, 3:6]
             traj_anim_b64 = animate_trajectory_with_frame(
                 ee_xyz, R_per_frame,
                 title=f"{cfg.name}: animated EE pose",
                 indices=common_indices, fps=shared_fps,
+                action_rotvec=action_rotvec,
             )
             traj_anim_plotly = build_plotly_traj_anim(
                 ee_xyz, R_per_frame,
                 title=f"{cfg.name}: animated EE pose",
                 indices=common_indices, fps=shared_fps,
+                action_rotvec=action_rotvec,
             )
 
     # ③ time series
@@ -771,6 +932,8 @@ def verify_one(short_name: str) -> dict:
         "notes":          cfg.notes,
         "n_frames":       eq["n_frames"],
         "equivalence":    eq,
+        "rot_roundtrip":  rot_rt,
+        "rot_rt_b64":     rot_rt_b64,
         "correlation":    corr,
         "scatter_b64":       scatter_b64,
         "traj_b64":          traj_b64,
@@ -817,6 +980,14 @@ def _r_cls(r: float) -> str:
     return "bad"
 
 
+def _rot_cls(max_deg: float) -> str:
+    # state-derived rotvec round-trips to ~1e-3°; allow generous headroom before
+    # flagging. >2° means a real convention/axis/sign error, not float noise.
+    if max_deg < 0.1: return "ok"
+    if max_deg < 2.0: return "meh"
+    return "bad"
+
+
 def render_html(results: list[dict], out_path: Path) -> None:
     parts = ["<!doctype html><html><head><meta charset='utf-8'>",
              "<title>OXE → LeRobot v2 验证报告</title>",
@@ -849,6 +1020,28 @@ def render_html(results: list[dict], out_path: Path) -> None:
             "</table>",
         ]
 
+        # ⑥ rotation round-trip (independent scipy reconstruction)
+        parts.append("<h3>⑥ 轴角旋转 round-trip（scipy 独立重建 R<sub>t+1</sub>）</h3>")
+        rt = r.get("rot_roundtrip")
+        if rt:
+            cls = _rot_cls(rt["max_deg"])
+            parts += [
+                "<p class='muted'>用 scipy 把 <code>action[t,3:6]</code> 当作 world 系相对旋转，"
+                "由 state 的 R<sub>t</sub> 重建 R<sub>t+1</sub>，与真实 R<sub>t+1</sub> 比测地角误差。"
+                "越接近 0 越好（state 派生的旋转应 ~1e-3°）；若达到几度则说明轴角数学/frame 约定/轴序有误。</p>",
+                "<table>",
+                f"<tr><th>有效帧</th><td>{rt['n_valid']}</td></tr>",
+                f"<tr><th>mean</th><td>{rt['mean_deg']:.3e}°</td></tr>",
+                f"<tr><th>median</th><td>{rt['median_deg']:.3e}°</td></tr>",
+                f"<tr><th>p99</th><td>{rt['p99_deg']:.3e}°</td></tr>",
+                f"<tr><th>max</th><td class='{cls}'>{rt['max_deg']:.3e}°</td></tr>",
+                "</table>",
+            ]
+            if r.get("rot_rt_b64"):
+                parts.append(f"<img src='data:image/png;base64,{r['rot_rt_b64']}'>")
+        else:
+            parts.append("<p class='muted'>该数据集 state 不含 EE 姿态，无法做旋转 round-trip，跳过此项。</p>")
+
         # ② correlation
         parts.append("<h3>② Action vs State-EE 速度相关性</h3>")
         if r["correlation"]:
@@ -868,7 +1061,7 @@ def render_html(results: list[dict], out_path: Path) -> None:
 
         # ④ video + synced trajectory GIF (top row), interactive Plotly (below).
         parts.append("<h3>④ 视频回放  ↔  末端轨迹 + 姿态动画（同步播放 + 可拖拽旋转）</h3>")
-        parts.append("<p class='muted'>上方左右两个 GIF 使用相同帧索引和 fps 同步播放：左是 primary + wrist 相机视频，右是 EE 位置（蓝线）+ 末端坐标系（红=x，绿=y，蓝=z），用来对比「视频里 gripper 的位置朝向」和「重构出的 EE 位姿」是否一致。下方是同一段数据的交互式 3D 视图——鼠标拖拽旋转，滚轮缩放，▶ 播放或拖动滑块查看任意帧。</p>")
+        parts.append("<p class='muted'>上方左右两个 GIF 使用相同帧索引和 fps 同步播放：左是 primary + wrist 相机视频，右是 EE 位置（蓝线）+ 末端坐标系（红=x，绿=y，蓝=z），以及当前帧 action 的轴角增量（品红箭头：方向=world 系下的旋转轴，长度∝该步旋转角，按本 episode 最大角归一化），用来对比「视频里 gripper 的位置朝向」和「重构出的 EE 位姿/动作」是否一致。下方是同一段数据的交互式 3D 视图——鼠标拖拽旋转，滚轮缩放，▶ 播放或拖动滑块查看任意帧。</p>")
         parts.append("<div class='side-by-side'>")
         parts.append("<figure>"
                      f"<img src='data:image/gif;base64,{r['gif_b64']}'>"
@@ -877,7 +1070,7 @@ def render_html(results: list[dict], out_path: Path) -> None:
         if r.get("traj_anim_b64"):
             parts.append("<figure>"
                          f"<img src='data:image/gif;base64,{r['traj_anim_b64']}'>"
-                         "<figcaption>EE 位置 + 姿态坐标系（GIF，与视频同步）</figcaption>"
+                         "<figcaption>EE 位置 + 姿态坐标系 + action 轴角增量（品红，GIF，与视频同步）</figcaption>"
                          "</figure>")
         parts.append("</div>")
         if r.get("traj_anim_plotly"):
@@ -895,7 +1088,7 @@ def render_html(results: list[dict], out_path: Path) -> None:
                 f"Plotly.newPlot('{div_id}',fig.data,fig.layout,{{responsive:true,displaylogo:false}})"
                 f".then(function(){{Plotly.addFrames('{div_id}',fig.frames);}});"
                 "})();</script>"
-                "<figcaption>EE 位置 + 姿态坐标系（交互式：拖拽旋转，滑块定格）</figcaption>"
+                "<figcaption>EE 位置 + 姿态坐标系 + action 轴角增量（品红；交互式：拖拽旋转，滑块定格）</figcaption>"
                 "</figure>"
             )
 

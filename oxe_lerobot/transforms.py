@@ -296,6 +296,28 @@ def action_taco_state_delta(step, prev_state) -> np.ndarray:
     return np.concatenate([pos, quat_wxyz, grip]).astype(np.float32)
 
 
+def action_nyu_state_delta(step, prev_state) -> np.ndarray:
+    """nyu_franka_play: derive the action from the *state* EE pose rather than the
+    raw 15D controller command. The command's Δrpy (a[10:13]) is a per-component
+    euler difference, which is NOT the true relative rotation between consecutive
+    orientations (euler angles don't subtract linearly) — feeding it straight to
+    a rotvec drifts ~2.5° mean / 6.7° max from the realized motion (caught by the
+    rotation round-trip check in verify_conversion.py). The command exactly equals
+    diff(state rpy), so the state carries the same intent without the euler-delta
+    error. Pack [pos, quat_wxyz, gripper] from state = [7 joint, 3 xyz, 3 rpy];
+    finalize derives the 7D delta with quaternion-relative rotation. Gripper comes
+    from the raw action command a[13] (state has no gripper channel)."""
+    obs = step["observation"]
+    state = _ensure_1d(obs["state"])
+    assert state.shape == (13,), f"expected 13D state, got {state.shape}"
+    pos = state[7:10].astype(np.float64)
+    quat_wxyz = euler_xyz_to_quat_wxyz(state[10:13].astype(np.float64))
+    a = _ensure_1d(step["action"])
+    assert a.shape == (15,), f"expected 15D action, got {a.shape}"
+    grip = a[13:14]
+    return np.concatenate([pos, quat_wxyz, grip]).astype(np.float32)
+
+
 def action_abs_euler_7d(step, prev_state) -> np.ndarray:
     # ucsd_kitchen / cmu_franka_exploration: 8D absolute [xyz, euler, grip, terminate]
     # → drop terminate, return 7D (treated as either absolute or already-delta per dataset notes)
@@ -320,10 +342,35 @@ def action_abs_quat_7d(step, prev_state) -> np.ndarray:
 
 
 def action_delta_xyz_only_4d(step, prev_state) -> np.ndarray:
-    # ucsd_pick_and_place: 4D [3 lin_vel, 1 gripper] — pad rot with zeros
+    """DEPRECATED — kept only for reference / backwards compat.
+
+    ucsd_pick_and_place's raw 4D action is [3 gripper *velocities*, 1 gripper
+    torque], with the velocities normalized/clipped to [-1, 1]. Treating them as
+    a position delta (zero-padding rotation and integrating) does NOT reproduce
+    the realized EE path: units differ, the command saturates at ±1, and it only
+    correlates ~0.65 with the state displacement. Use `ucsd_pick_state_delta`
+    instead, which derives the delta from successive state EE poses."""
     a = _ensure_1d(step["action"])
     assert a.shape == (4,), f"expected 4D, got {a.shape}"
     return np.array([a[0], a[1], a[2], 0.0, 0.0, 0.0, a[3]], dtype=np.float32)
+
+
+def action_ucsd_pick_state_delta(step, prev_state) -> np.ndarray:
+    """ucsd_pick_and_place: derive the action from the *state* EE pose rather
+    than the raw normalized velocity command (see action_delta_xyz_only_4d for
+    why the raw command can't be integrated). Mirrors the unit-consistency choice
+    made for taco_play / nyu_franka_play. State is 7D
+    [gripper_pos(3), gripper_ori_euler(3), finger_dist(1)]; pack
+    [pos, quat_wxyz, gripper] where gripper is the raw action's torque command
+    (matching the command-gripper convention used by the other *_state_delta
+    datasets). Finalize derives the 7D delta from successive states."""
+    obs = step["observation"]
+    state = _ensure_1d(obs["state"])
+    assert state.shape == (7,), f"expected 7D state, got {state.shape}"
+    pos = state[0:3].astype(np.float64)
+    quat_wxyz = euler_xyz_to_quat_wxyz(state[3:6].astype(np.float64))
+    grip = _ensure_1d(step["action"])[3:4]
+    return np.concatenate([pos, quat_wxyz, grip]).astype(np.float32)
 
 
 ACTION_FNS = {
@@ -344,6 +391,8 @@ ACTION_FNS = {
     "austin_sailor_state_delta":    action_austin_sailor_state_delta,
     "austin_sirius_state_delta":    action_austin_sirius_state_delta,
     "taco_state_delta":             action_taco_state_delta,
+    "nyu_state_delta":              action_nyu_state_delta,
+    "ucsd_pick_state_delta":        action_ucsd_pick_state_delta,
 }
 
 
@@ -358,6 +407,8 @@ STATE_DELTA_KINDS = {
     "austin_sailor_state_delta",
     "austin_sirius_state_delta",
     "taco_state_delta",
+    "nyu_state_delta",
+    "ucsd_pick_state_delta",
 }
 
 
