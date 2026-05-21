@@ -40,6 +40,10 @@ def _extract_raw_command_6d(cfg, raw_step: dict) -> np.ndarray | None:
         wv = np.asarray(a["world_vector"],  dtype=np.float32).reshape(-1)
         rd = np.asarray(a["rotation_delta"], dtype=np.float32).reshape(-1)
         return np.concatenate([wv, rd]).astype(np.float32)  # 6D normalized command
+    if name == "taco_play":
+        # rel_actions_world is 7D [Δxyz, Δrpy, grip] (CALVIN-normalized command)
+        a = np.asarray(raw_step["action"]["rel_actions_world"], dtype=np.float32).reshape(-1)
+        return a[:6].astype(np.float32)
     # All five other STATE_DELTA datasets: raw action is 7D [Δxyz, Δrpy, grip]
     if name in {"stanford_hydra", "austin_buds", "austin_sailor",
                 "austin_sirius", "utaustin_mutex"}:

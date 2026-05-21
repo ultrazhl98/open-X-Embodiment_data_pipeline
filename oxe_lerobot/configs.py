@@ -15,7 +15,12 @@ Action conversion kinds:
                         optional unit normalization (mm→m, deg→rad). Used by ucsd_kitchen.
   - "joint_vel_plus_delta": action is 15D, slice [7:13] (Δxyz, Δrpy) + [13] (gripper) → 7D.
   - "delta_xyz_only_4d":    action is 4D [3 lin_vel, 1 gripper] — pad rotation with zeros.
-  - "taco_rel_world":   pick action['rel_actions_world'] (7D) directly.
+  - "taco_state_delta": action is rel_actions_world (CALVIN-normalized, ~50× larger
+                        than physical motion), so we replace it with state-delta
+                        derived from robot_obs (pos + euler) — same pattern as
+                        viola/stanford_hydra/austin_* — to keep units consistent
+                        (m + rad) across all 13 datasets. Gripper command kept
+                        from rel_actions_world[6] (±1).
   - "*_state_delta" family: action derived from state ΔEE pose. Per-step fn packs
                         [pos(3), quat_wxyz(4), grip(1)] from the state observation; finalize
                         diffs successive packed states (look-ahead). Used by furniture_bench,
@@ -148,9 +153,15 @@ DATASETS: dict[str, DatasetConfig] = {
         image_primary_key="rgb_static",
         image_wrist_key="rgb_gripper",
         state_key="robot_obs",
-        action_kind="taco_rel_world",
+        action_kind="taco_state_delta",
         language_key="natural_language_instruction",
         language_in_observation=True,
+        notes="action derived from state ΔEE pose (robot_obs[0:3] pos m + "
+              "robot_obs[3:6] euler rad → quat → diff next). Raw rel_actions_world "
+              "is a CALVIN-normalized command (~40-50× pos, ~20× rot z), not "
+              "physical Δm/Δrad — replaced for unit consistency with other "
+              "datasets. Gripper from rel_actions_world[6] (±1). Scale stored in "
+              "info.json/action_metadata.",
     ),
     "nyu_franka_play_dataset_converted_externally_to_rlds": DatasetConfig(
         name="nyu_franka_play",
