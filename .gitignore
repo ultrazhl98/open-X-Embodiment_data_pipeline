@@ -1,6 +1,10 @@
 # Data (downloaded raw shards + converted LeRobot outputs) — too large for git
 data/
 
+# Third-party reference repos (cloned for comparison, not part of this project)
+octo/
+openvla/
+
 # Python
 __pycache__/
 *.py[cod]
