@@ -171,16 +171,13 @@ def action_delta_7d_pack(step, prev_state) -> np.ndarray:
     ).astype(np.float32)
 
 
-def action_taco_rel_world(step, prev_state) -> np.ndarray:
-    a = step["action"]
-    return _ensure_1d(a["rel_actions_world"])  # already 7D
-
-
 def action_joint_vel_plus_delta(step, prev_state) -> np.ndarray:
     # nyu_franka_play: 15D = [7 joint_vel, 3 Δxyz, 3 Δrpy, 1 gripper, 1 terminate]
+    # Rotation a[10:13] is XYZ euler delta → convert to axis-angle.
     a = _ensure_1d(step["action"])
     assert a.shape == (15,), f"expected 15D, got {a.shape}"
-    return np.concatenate([a[7:13], a[13:14]]).astype(np.float32)
+    drotvec = _euler_xyz_to_rotvec(a[10:13])
+    return np.concatenate([a[7:10], drotvec, a[13:14]]).astype(np.float32)
 
 
 def action_delta_furniture_8d(step, prev_state) -> np.ndarray:
@@ -281,6 +278,24 @@ def action_austin_sirius_state_delta(step, prev_state) -> np.ndarray:
     return action_state_ee_field_state_delta(step, prev_state)
 
 
+def action_taco_state_delta(step, prev_state) -> np.ndarray:
+    """taco_play: robot_obs is 15D [tcp_pos(3) m, tcp_euler(3) rad, gripper_width(1),
+    7 joint_pos, gripper_action(1)]. Pack [pos, quat_wxyz, gripper] where gripper
+    comes from the raw action's rel_actions_world[6] (±1 binary command), matching
+    the convention used by viola / stanford_hydra / austin_* (state pose +
+    command gripper). Finalize derives the physical-units 7D delta — sidesteps
+    the fact that rel_actions_world[:6] is a CALVIN-normalized command, not a
+    physical Δm/Δrad."""
+    obs = step["observation"]
+    state = _ensure_1d(obs["robot_obs"])
+    assert state.shape == (15,), f"expected 15D robot_obs, got {state.shape}"
+    pos = state[0:3].astype(np.float64)
+    quat_wxyz = euler_xyz_to_quat_wxyz(state[3:6].astype(np.float64))
+    raw_a = _ensure_1d(step["action"]["rel_actions_world"])
+    grip = raw_a[6:7]
+    return np.concatenate([pos, quat_wxyz, grip]).astype(np.float32)
+
+
 def action_abs_euler_7d(step, prev_state) -> np.ndarray:
     # ucsd_kitchen / cmu_franka_exploration: 8D absolute [xyz, euler, grip, terminate]
     # → drop terminate, return 7D (treated as either absolute or already-delta per dataset notes)
@@ -314,7 +329,6 @@ def action_delta_xyz_only_4d(step, prev_state) -> np.ndarray:
 ACTION_FNS = {
     "delta_7d":                 action_delta_7d,
     "delta_7d_pack":            action_delta_7d_pack,
-    "taco_rel_world":           action_taco_rel_world,
     "joint_vel_plus_delta":     action_joint_vel_plus_delta,
     "furniture_state_delta":    action_furniture_state_delta,
     "abs_euler_7d":             action_abs_euler_7d,            # cmu_franka_exploration: values are deltas
@@ -329,6 +343,7 @@ ACTION_FNS = {
     "utaustin_mutex_state_delta":   action_utaustin_mutex_state_delta,
     "austin_sailor_state_delta":    action_austin_sailor_state_delta,
     "austin_sirius_state_delta":    action_austin_sirius_state_delta,
+    "taco_state_delta":             action_taco_state_delta,
 }
 
 
@@ -342,6 +357,7 @@ STATE_DELTA_KINDS = {
     "utaustin_mutex_state_delta",
     "austin_sailor_state_delta",
     "austin_sirius_state_delta",
+    "taco_state_delta",
 }
 
 
@@ -407,8 +423,8 @@ def _finalize_via_command_delta(canonical_steps: list[dict]) -> list[dict]:
     convention to match OXE/Octo's `action[t] = state[t+1] - state[t]`:
         action[t] = command[t+1] - command[t]   for  t < N-1
         action[N-1] = 0 (no next target)
-    Rotation uses quaternion-relative math (q_rel = q_next · q_curr⁻¹) and a
-    single quat→euler — avoids ±π Euler wrap."""
+    Rotation uses quaternion-relative math (q_rel = q_next · q_curr⁻¹)
+    converted to axis-angle — avoids ±π wrap and gimbal lock."""
     n = len(canonical_steps)
     out = []
     for t, s in enumerate(canonical_steps):
@@ -420,8 +436,8 @@ def _finalize_via_command_delta(canonical_steps: list[dict]) -> list[dict]:
             nxt = np.asarray(canonical_steps[t + 1]["action"], dtype=np.float64)
             dxyz = nxt[:3] - raw[:3]
             q_rel = quat_relative_wxyz(raw[3:7], nxt[3:7])
-            drpy = _quat_wxyz_to_euler_xyz(q_rel)
-            delta = np.concatenate([dxyz, drpy, [raw[7]]]).astype(np.float32)
+            drotvec = _quat_wxyz_to_rotvec(q_rel)
+            delta = np.concatenate([dxyz, drotvec, [raw[7]]]).astype(np.float32)
         out.append({**s, "action": delta})
     return out
 
@@ -460,15 +476,15 @@ def _finalize_via_state_delta(canonical_steps: list[dict]) -> list[dict]:
             else:
                 dxyz = nxt[:3] - raw[:3]
                 q_rel = quat_relative_wxyz(raw[3:7], nxt[3:7])
-                drpy = _quat_wxyz_to_euler_xyz(q_rel)
-                delta = np.concatenate([dxyz, drpy, [raw[7]]]).astype(np.float32)
+                drotvec = _quat_wxyz_to_rotvec(q_rel)
+                delta = np.concatenate([dxyz, drotvec, [raw[7]]]).astype(np.float32)
         out.append({**s, "action": delta})
     return out
 
 
 def _quat_wxyz_to_euler_xyz(q: np.ndarray) -> np.ndarray:
-    """Same math as quat_to_euler_xyz, but on (w,x,y,z) directly. Returns
-    XYZ Tait-Bryan euler (roll, pitch, yaw) as float32."""
+    """(w,x,y,z) → XYZ Tait-Bryan euler (roll, pitch, yaw) as float32.
+    Kept for reference; action pipeline now uses _quat_wxyz_to_rotvec."""
     w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
     sinr = 2.0 * (w * x + y * z)
     cosr = 1.0 - 2.0 * (x * x + y * y)
@@ -481,6 +497,32 @@ def _quat_wxyz_to_euler_xyz(q: np.ndarray) -> np.ndarray:
     return np.array([roll, pitch, yaw], dtype=np.float32)
 
 
+def _quat_wxyz_to_rotvec(q: np.ndarray) -> np.ndarray:
+    """(w,x,y,z) unit quaternion → axis-angle rotation vector (rad).
+
+    The rotation vector v = n̂·θ encodes both the rotation axis n̂ and angle θ
+    in its direction and magnitude.  Continuous near zero rotation (v → 0 as
+    θ → 0), no gimbal lock, no ±π ambiguity for |θ| < π.  Shortest-path
+    convention: w is forced ≥ 0 so |θ| ≤ π.
+    """
+    w = float(q[0])
+    xyz = np.array([float(q[1]), float(q[2]), float(q[3])], dtype=np.float64)
+    if w < 0:               # shortest path: flip to equivalent quaternion
+        w, xyz = -w, -xyz
+    w = np.clip(w, 0.0, 1.0)
+    sin_half = np.sqrt(max(0.0, 1.0 - w * w))
+    if sin_half < 1e-8:     # near-zero rotation: rotvec ≈ 2·(x,y,z)
+        return (2.0 * xyz).astype(np.float32)
+    angle = 2.0 * np.arccos(w)
+    return (xyz / sin_half * angle).astype(np.float32)
+
+
+def _euler_xyz_to_rotvec(rpy: np.ndarray) -> np.ndarray:
+    """XYZ Tait-Bryan euler angles (rad) → axis-angle rotation vector (rad)."""
+    q = euler_xyz_to_quat_wxyz(np.asarray(rpy, dtype=np.float64))
+    return _quat_wxyz_to_rotvec(q)
+
+
 def _finalize_via_euler_to_delta(canonical_steps: list[dict],
                                  pos_scale: float = 1.0,
                                  rot_in_degrees: bool = False) -> list[dict]:
@@ -490,7 +532,7 @@ def _finalize_via_euler_to_delta(canonical_steps: list[dict],
     (euler→quat, q_rel, quat→euler) so ±π wraparound doesn't bite.  Optional
     unit normalization: ucsd_kitchen stores position in mm and rotation in
     degrees, so we pass `pos_scale=1e-3, rot_in_degrees=True` to land in
-    standard SI units (m + rad)."""
+    standard SI units (m + rad).  Rotation output is axis-angle (rotvec)."""
     n = len(canonical_steps)
     out = []
     deg2rad = np.pi / 180.0 if rot_in_degrees else 1.0
@@ -507,8 +549,20 @@ def _finalize_via_euler_to_delta(canonical_steps: list[dict],
             q_curr = euler_xyz_to_quat_wxyz(e_curr)
             q_next = euler_xyz_to_quat_wxyz(e_next)
             q_rel = quat_relative_wxyz(q_curr, q_next)
-            drpy = _quat_wxyz_to_euler_xyz(q_rel)         # radians
-            delta = np.concatenate([dxyz, drpy, [raw[6]]]).astype(np.float32)
+            drotvec = _quat_wxyz_to_rotvec(q_rel)
+            delta = np.concatenate([dxyz, drotvec, [raw[6]]]).astype(np.float32)
+        out.append({**s, "action": delta})
+    return out
+
+
+def _finalize_euler_delta_to_rotvec(canonical_steps: list[dict]) -> list[dict]:
+    """For cmu_franka_exploration: action is already a 7D delta [Δxyz, Δrpy, gripper]
+    where Δrpy is XYZ Tait-Bryan euler.  Convert rotation to axis-angle in-place."""
+    out = []
+    for s in canonical_steps:
+        a = np.asarray(s["action"], dtype=np.float64)
+        drotvec = _euler_xyz_to_rotvec(a[3:6])
+        delta = np.concatenate([a[:3], drotvec, a[6:7]]).astype(np.float32)
         out.append({**s, "action": delta})
     return out
 
@@ -516,7 +570,7 @@ def _finalize_via_euler_to_delta(canonical_steps: list[dict],
 def finalize_actions_to_delta(canonical_steps: list[dict], cfg) -> list[dict]:
     """Second pass to compute the final 7D delta action for datasets whose
     per-step `action_fn` only emitted an intermediate (raw target pose or
-    packed state). No-op for already-delta kinds."""
+    packed state).  All paths output rotation as axis-angle (rotvec)."""
     if cfg.action_kind in STATE_DELTA_KINDS:
         return _finalize_via_state_delta(canonical_steps)
     if cfg.action_kind == "abs_quat_7d":
@@ -526,4 +580,8 @@ def finalize_actions_to_delta(canonical_steps: list[dict], cfg) -> list[dict]:
         return _finalize_via_euler_to_delta(canonical_steps,
                                             pos_scale=1e-3,
                                             rot_in_degrees=True)
+    if cfg.action_kind == "abs_euler_7d":
+        # cmu_franka_exploration: per-step fn already emits [Δxyz, Δrpy, gripper];
+        # convert the euler rotation part to axis-angle.
+        return _finalize_euler_delta_to_rotvec(canonical_steps)
     return canonical_steps
