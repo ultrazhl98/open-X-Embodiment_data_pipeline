@@ -48,7 +48,8 @@ from oxe_lerobot.transforms import (  # noqa: E402
     ACTION_FNS,
     STATE_DELTA_KINDS,
     _is_degenerate_pose,
-    _quat_wxyz_to_euler_xyz,
+    _euler_xyz_to_rotvec,
+    _quat_wxyz_to_rotvec,
     euler_xyz_to_quat_wxyz,
     finalize_actions_to_delta,
     quat_relative_wxyz,
@@ -141,7 +142,7 @@ def independent_expected_action(cfg, raw_steps: list[dict]) -> np.ndarray:
         for t in range(n - 1):
             out[t, :3] = raws[t + 1, :3] - raws[t, :3]
             q_rel = quat_relative_wxyz(raws[t, 3:7], raws[t + 1, 3:7])
-            out[t, 3:6] = _quat_wxyz_to_euler_xyz(q_rel)
+            out[t, 3:6] = _quat_wxyz_to_rotvec(q_rel)
             out[t, 6]   = raws[t, 7]
         out[n - 1, :6] = 0.0
         out[n - 1, 6]  = raws[n - 1, 7]
@@ -162,7 +163,7 @@ def independent_expected_action(cfg, raw_steps: list[dict]) -> np.ndarray:
                 continue
             out[t, :3] = packed[t + 1, :3] - packed[t, :3]
             q_rel = quat_relative_wxyz(packed[t, 3:7], packed[t + 1, 3:7])
-            out[t, 3:6] = _quat_wxyz_to_euler_xyz(q_rel)
+            out[t, 3:6] = _quat_wxyz_to_rotvec(q_rel)
             out[t, 6]   = packed[t, 7]
         out[n - 1, :6] = 0.0
         out[n - 1, 6]  = packed[n - 1, 7]
@@ -179,11 +180,20 @@ def independent_expected_action(cfg, raw_steps: list[dict]) -> np.ndarray:
             q_curr = euler_xyz_to_quat_wxyz(raws[t, 3:6]     * deg2rad)
             q_next = euler_xyz_to_quat_wxyz(raws[t + 1, 3:6] * deg2rad)
             q_rel  = quat_relative_wxyz(q_curr, q_next)
-            out[t, 3:6] = _quat_wxyz_to_euler_xyz(q_rel)
+            out[t, 3:6] = _quat_wxyz_to_rotvec(q_rel)
             out[t, 6]   = raws[t, 6]
         out[n - 1, :6] = 0.0
         out[n - 1, 6]  = raws[n - 1, 6]
         return out
+
+    if cfg.action_kind == "abs_euler_7d":
+        # cmu_franka_exploration: per-step action is already a 7D delta whose
+        # rot channels are euler; finalize converts those euler[3:6] → rotvec.
+        fn = ACTION_FNS[cfg.action_kind]
+        out = np.stack([fn(s, None) for s in raw_steps]).astype(np.float64)
+        for t in range(len(out)):
+            out[t, 3:6] = _euler_xyz_to_rotvec(out[t, 3:6])
+        return out.astype(np.float32)
 
     # Already-delta kinds — just run the per-step function.
     fn = ACTION_FNS[cfg.action_kind]
@@ -504,11 +514,13 @@ def build_plotly_traj_anim(ee_xyz: np.ndarray,
     n = len(ee_xyz)
     idx = indices if indices is not None else _downsample_indices(n, target_frames)
 
-    mins = ee_xyz.min(axis=0)
-    maxs = ee_xyz.max(axis=0)
+    # Include world origin in view range so the world-axis triad is always visible.
+    mins = np.minimum(ee_xyz.min(axis=0), 0.0)
+    maxs = np.maximum(ee_xyz.max(axis=0), 0.0)
     center = (mins + maxs) / 2
     half_range = max(((maxs - mins).max() / 2) * 1.25, 0.05)
     axis_len = float(half_range * 0.18)
+    world_axis_len = float(half_range * 0.30)
 
     def axis_segment(origin: np.ndarray, R: np.ndarray, col: int) -> dict:
         end = origin + R[:, col] * axis_len
@@ -575,6 +587,35 @@ def build_plotly_traj_anim(ee_xyz: np.ndarray,
          "marker": {"color": "green", "size": 5},
          "name": "start"},
     ]
+
+    # World-frame axis triad at origin (red=X, green=Y, blue=Z) — static, helps the
+    # viewer identify which direction each scene axis points to when rotating.
+    for col, (color, label) in enumerate([
+        ("#d62728", "X"), ("#2ca02c", "Y"), ("#1f77b4", "Z"),
+    ]):
+        tip = [0.0, 0.0, 0.0]
+        tip[col] = world_axis_len
+        lbl = [0.0, 0.0, 0.0]
+        lbl[col] = world_axis_len * 1.18
+        direction = [0.0, 0.0, 0.0]
+        direction[col] = 1.0
+        data.extend([
+            {"type": "scatter3d", "mode": "lines",
+             "x": [0.0, tip[0]], "y": [0.0, tip[1]], "z": [0.0, tip[2]],
+             "line": {"color": color, "width": 5},
+             "name": f"world {label}", "hoverinfo": "skip", "showlegend": False},
+            {"type": "cone",
+             "x": [tip[0]], "y": [tip[1]], "z": [tip[2]],
+             "u": [direction[0]], "v": [direction[1]], "w": [direction[2]],
+             "sizemode": "absolute", "sizeref": world_axis_len * 0.30,
+             "anchor": "tip", "showscale": False,
+             "colorscale": [[0, color], [1, color]],
+             "hoverinfo": "skip", "showlegend": False},
+            {"type": "scatter3d", "mode": "text",
+             "x": [lbl[0]], "y": [lbl[1]], "z": [lbl[2]],
+             "text": [label], "textfont": {"color": color, "size": 14},
+             "hoverinfo": "skip", "showlegend": False},
+        ])
 
     frame_ms = int(1000 / fps)
     play_args = [None, {"frame": {"duration": frame_ms, "redraw": True},
@@ -877,7 +918,8 @@ def main():
         print(f"=== {name} ===")
         results.append(verify_one(name))
 
-    out = out_dir / "report.html"
+    out_name = sys.argv[1] if len(sys.argv) > 1 else "report_rotvec.html"
+    out = out_dir / out_name
     render_html(results, out)
     print(f"\nWrote {out}  ({out.stat().st_size // 1024} KB)")
 
