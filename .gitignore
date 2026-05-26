@@ -4,6 +4,7 @@ data/
 # Third-party reference repos (cloned for comparison, not part of this project)
 octo/
 openvla/
+ABot-Manipulation/
 
 # Python
 __pycache__/

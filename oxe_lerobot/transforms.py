@@ -218,15 +218,24 @@ def action_viola_state_delta(step, prev_state) -> np.ndarray:
 
 
 def action_stanford_hydra_state_delta(step, prev_state) -> np.ndarray:
-    """stanford_hydra: state is 27D [pos(3), quat_wxyz(4), euler(3), 7 joint,
-    7 joint_vel, 3 gripper]. Pack [pos, quat, action[6]=gripper_close] — we use
-    the raw action's gripper command (not state) because the state's 3 gripper
+    """stanford_hydra: state is 27D [pos(3), quat(4), euler(3), 7 joint,
+    7 joint_vel, 3 gripper]. Pack [pos, quat_wxyz, action[6]=gripper_close] — we
+    use the raw action's gripper command (not state) because the state's 3 gripper
     channels are joint-level (finger positions), whereas action[6] is the
-    command. Finalize derives delta."""
+    command. Finalize derives delta.
+
+    NOTE: the raw state quaternion at [3:7] is stored **(x, y, z, w)**, not
+    (w, x, y, z). Verified against the dataset's own euler field [7:10]: only
+    `quat=xyzw` reproduces R(euler) under our extrinsic-xyz (Rz·Ry·Rx) convention
+    (0.0° over the whole trajectory), and the w-component is ~0 at rest where the
+    euler shows roll≈±π (a 180° flip). Reading it as wxyz silently rotated the
+    orientation by ~159° absolute (≈1.7° on the delta, which mostly cancels).
+    We reorder to wxyz here so the downstream quaternion-relative math is correct."""
     obs = step["observation"]
     state = _ensure_1d(obs["state"])
     pos = state[0:3]
-    quat_wxyz = state[3:7]
+    quat_xyzw = state[3:7]
+    quat_wxyz = quat_xyzw[[3, 0, 1, 2]]  # (x,y,z,w) -> (w,x,y,z)
     raw_a = _ensure_1d(step["action"])
     grip = raw_a[6:7]
     return np.concatenate([pos, quat_wxyz, grip]).astype(np.float32)
