@@ -448,9 +448,11 @@ def extract_rotations(cfg, lerobot_state: np.ndarray, raw_steps: list[dict]) -> 
         return R
 
     if name == "stanford_hydra":
-        # state[3:7] is (w, x, y, z) (largest component at index 0; verified)
+        # raw state[3:7] is stored (x, y, z, w); reorder to wxyz to match the
+        # action path (action_stanford_hydra_state_delta does the same).
         for t in range(n):
-            R[t] = quat_wxyz_to_rotmat(lerobot_state[t, 3:7])
+            q = lerobot_state[t, 3:7]
+            R[t] = quat_wxyz_to_rotmat(q[[3, 0, 1, 2]])
         return R
 
     if name in ("austin_buds", "utaustin_mutex"):
