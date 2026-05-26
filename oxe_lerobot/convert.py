@@ -23,6 +23,11 @@ from .transforms import (
     _is_degenerate_pose,
 )
 from .lerobot_writer import LeRobotV2Writer
+from .openvla_transforms import (
+    openvla_actions_for_trajectory,
+    unit_gripper_for_trajectory,
+    OPENVLA_ACTION_NOTES,
+)
 
 
 def _extract_raw_command_6d(cfg, raw_step: dict) -> np.ndarray | None:
@@ -62,6 +67,24 @@ def _compute_command_to_state_scale(
     return (num / den).astype(np.float64)
 
 
+def _frames_from_canonical(canonical: list[dict], image_keys: list[str]) -> list[dict]:
+    """Pack standardized canonical steps into LeRobot writer frame dicts."""
+    frames = []
+    for c in canonical:
+        imgs = {"primary": c["image_primary"]}
+        if "wrist" in image_keys:
+            imgs["wrist"] = c["image_wrist"]
+        if "secondary" in image_keys:
+            imgs["secondary"] = c["image_secondary"]
+        frames.append({
+            "action": c["action"],
+            "state":  c["state"],
+            "images": imgs,
+            "language_instruction": c["language_instruction"],
+        })
+    return frames
+
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -70,11 +93,15 @@ def convert_one(
     raw_root: Path,
     out_root: Path,
     max_episodes: int | None = None,
+    action_format: str = "ours",
 ) -> None:
     cfg = get_config(rlds_name)
     raw_dir = raw_root / cfg.rlds_name / "0.1.0"
     if not raw_dir.exists():
         raise FileNotFoundError(f"Missing raw dir: {raw_dir}")
+
+    openvla_mode = action_format == "openvla"
+    repo_prefix = "oxe_franka_openvla" if openvla_mode else "oxe_franka"
 
     # Decide which image keys to materialize for this dataset.
     image_keys: list[str] = ["primary"]
@@ -102,7 +129,7 @@ def convert_one(
 
     with LeRobotV2Writer(
         root=str(out_dir),
-        repo_id=f"oxe_franka/{cfg.name}",
+        repo_id=f"{repo_prefix}/{cfg.name}",
         fps=cfg.fps,
         robot_type="franka_panda",
         image_keys=tuple(image_keys),
@@ -126,6 +153,23 @@ def convert_one(
                 c = standardize_step(cfg, raw, prev)
                 canonical.append(c)
                 prev = c
+
+            if openvla_mode:
+                # OpenVLA format: per-step raw-action transform (no state-delta,
+                # no finalize, no degenerate filtering). Overwrite the action
+                # channel; images / state / language stay identical to `ours` so
+                # the comparison isolates the action representation.
+                ov_actions = openvla_actions_for_trajectory(cfg, steps)
+                if len(ov_actions) != len(canonical):
+                    raise ValueError(
+                        f"[{cfg.name}] OpenVLA action count {len(ov_actions)} "
+                        f"!= step count {len(canonical)}"
+                    )
+                for c, a in zip(canonical, ov_actions):
+                    c["action"] = np.asarray(a, dtype=np.float32)
+                frames = _frames_from_canonical(canonical, image_keys)
+                writer.write_episode(ep_idx, frames)
+                continue
 
             # Data-integrity filter for state-derived datasets: drop frames
             # whose packed EE pose is identically zero. These come from RLDS
@@ -154,6 +198,18 @@ def convert_one(
 
             canonical = finalize_actions_to_delta(canonical, cfg)
 
+            # Normalize the gripper channel to [0, 1] (+1=open / 0=close), using
+            # the same per-dataset convention as the OpenVLA format so the two
+            # outputs differ only in their motion channels. Computed over the
+            # kept raw steps (1:1 with `canonical` after degenerate filtering).
+            grip = unit_gripper_for_trajectory(cfg, steps_kept)
+            if len(grip) != len(canonical):
+                raise ValueError(
+                    f"[{cfg.name}] gripper length {len(grip)} != frames {len(canonical)}"
+                )
+            for c, g in zip(canonical, grip):
+                c["action"][6] = np.float32(g)
+
             # First episode of a STATE_DELTA dataset: compute the raw-command →
             # state-delta scale from the kept frames so it's consistent with
             # the data actually written to parquet.
@@ -175,29 +231,42 @@ def convert_one(
                         "source": f"estimated from episode 0 ({n - 1} kept frames)",
                     }
 
-            frames = []
-            for c in canonical:
-                imgs = {"primary": c["image_primary"]}
-                if "wrist" in image_keys:
-                    imgs["wrist"] = c["image_wrist"]
-                if "secondary" in image_keys:
-                    imgs["secondary"] = c["image_secondary"]
-                frames.append({
-                    "action": c["action"],
-                    "state":  c["state"],
-                    "images": imgs,
-                    "language_instruction": c["language_instruction"],
-                })
+            frames = _frames_from_canonical(canonical, image_keys)
             writer.write_episode(ep_idx, frames)
 
         # After all episodes: write action_semantics + scale + filter stats
         # into info.json as a single action_metadata block.
-        if cfg.action_kind in STATE_DELTA_KINDS:
+        if openvla_mode:
+            writer.set_action_metadata({
+                "action_semantics": "openvla_raw",
+                "action_metadata": {
+                    "definition": (
+                        "OpenVLA-style action: per-step transform of the raw RLDS "
+                        "action field (NumPy port of OpenVLA's "
+                        "oxe/transforms.py). 7D [dx, dy, dz, drx, dry, drz, gripper]; "
+                        "rotation in the raw dataset's own representation (euler / "
+                        "axis-angle; quaternion fields converted to XYZ euler); "
+                        "gripper normalized to +1=open / 0=close. NOT state-derived, "
+                        "no quaternion-relative math, no unit normalization, no "
+                        "absolute→delta conversion, no degenerate-frame filtering."
+                    ),
+                    "per_dataset_note": OPENVLA_ACTION_NOTES.get(cfg.name, ""),
+                    "differs_from_ours": (
+                        "the 'ours' format derives a physical 7D delta from "
+                        "successive state EE poses with axis-angle rotation and SI "
+                        "unit normalization; this 'openvla' format trusts the raw "
+                        "action as OpenVLA does (e.g. ucsd_kitchen stays absolute "
+                        "in mm/deg, taco_play stays in CALVIN-normalized units)."
+                    ),
+                },
+            })
+        elif cfg.action_kind in STATE_DELTA_KINDS:
             action_meta = {
                 "definition": (
                     "action[t] = state[t+1] - state[t] (look-ahead, last frame "
                     "zero); rotation via quaternion-relative math; gripper "
-                    "passes through raw command (or state for furniture_bench)."
+                    "normalized to [0,1] (+1=open / 0=close) using the same "
+                    "per-dataset convention as the OpenVLA format."
                 ),
             }
             if scale_payload is not None:
@@ -249,12 +318,23 @@ def main():
     p.add_argument("--all", action="store_true", help="convert every dataset listed in configs.")
     p.add_argument("--max-episodes", type=int, default=None,
                    help="cap episodes per dataset (useful for smoke tests).")
+    p.add_argument("--action-format", choices=["ours", "openvla"], default="ours",
+                   help="action conversion recipe: 'ours' (state-derived 7D physical "
+                        "delta, axis-angle, SI units) or 'openvla' (faithful port of "
+                        "OpenVLA's per-dataset raw-action transforms).")
     p.add_argument("--raw-root", type=str, default=str(PROJECT_ROOT / "data" / "raw"))
-    p.add_argument("--out-root", type=str, default=str(PROJECT_ROOT / "data" / "lerobot"))
+    p.add_argument("--out-root", type=str, default=None,
+                   help="output root. Defaults to data/lerobot for --action-format ours, "
+                        "data/lerobot_openvla for --action-format openvla.")
     args = p.parse_args()
 
     raw_root = Path(args.raw_root)
-    out_root = Path(args.out_root)
+    if args.out_root is not None:
+        out_root = Path(args.out_root)
+    elif args.action_format == "openvla":
+        out_root = PROJECT_ROOT / "data" / "lerobot_openvla"
+    else:
+        out_root = PROJECT_ROOT / "data" / "lerobot"
 
     if args.all:
         names = list(DATASETS.keys())
@@ -266,7 +346,8 @@ def main():
 
     for n in names:
         try:
-            convert_one(n, raw_root, out_root, max_episodes=args.max_episodes)
+            convert_one(n, raw_root, out_root, max_episodes=args.max_episodes,
+                        action_format=args.action_format)
         except Exception as e:
             print(f"[FAIL] {n}: {e!r}", file=sys.stderr)
             raise

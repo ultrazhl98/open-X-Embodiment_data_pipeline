@@ -55,6 +55,11 @@ from oxe_lerobot.transforms import (  # noqa: E402
     quat_relative_wxyz,
     standardize_step,
 )
+from oxe_lerobot.openvla_transforms import (  # noqa: E402
+    openvla_actions_for_trajectory,
+    unit_gripper_for_trajectory,
+    OPENVLA_ACTION_NOTES,
+)
 
 
 VERIFY = [
@@ -92,8 +97,9 @@ def _gif_b64(frames: list[np.ndarray], fps: int = 5) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _read_lerobot_ep(short_name: str, ep_index: int = 0) -> dict:
-    root = ROOT / "data" / "lerobot" / short_name
+def _read_lerobot_ep(short_name: str, ep_index: int = 0, fmt: str = "ours") -> dict:
+    base = "lerobot_openvla" if fmt == "openvla" else "lerobot"
+    root = ROOT / "data" / base / short_name
     pq_path = root / f"data/chunk-000/episode_{ep_index:06d}.parquet"
     t = pq.read_table(pq_path)
     out = {
@@ -107,9 +113,13 @@ def _read_lerobot_ep(short_name: str, ep_index: int = 0) -> dict:
     return out
 
 
-def _read_rlds_first_episode(cfg) -> list[dict]:
+def _read_rlds_first_episode(cfg, fmt: str = "ours") -> list[dict]:
     raw_dir = str(ROOT / "data" / "raw" / cfg.rlds_name / "0.1.0")
     for ep in iter_episodes(raw_dir, max_episodes=1):
+        # OpenVLA keeps every frame (no degenerate filtering), so the raw steps
+        # must stay unfiltered to align 1:1 with its parquet.
+        if fmt == "openvla":
+            return ep["steps"]
         return _filter_raw_steps_for_state_delta(cfg, ep["steps"])
     raise RuntimeError(f"no episode in {raw_dir}")
 
@@ -128,11 +138,27 @@ def _filter_raw_steps_for_state_delta(cfg, raw_steps: list[dict]) -> list[dict]:
 
 # ---------------------------- ① numerical equivalence ---------------------------- #
 
-def independent_expected_action(cfg, raw_steps: list[dict]) -> np.ndarray:
+def independent_expected_action(cfg, raw_steps: list[dict], fmt: str = "ours") -> np.ndarray:
     """Recompute the canonical action **directly from raw fields**, bypassing the
     standardize_step/finalize_actions_to_delta abstraction.  If this matches
     the parquet action, the abstraction is doing what we say it is."""
 
+    if fmt == "openvla":
+        # OpenVLA path: the expected action IS the per-step transform output.
+        return openvla_actions_for_trajectory(cfg, raw_steps)
+
+    # 'ours': motion channels from the state-derived delta, gripper overwritten
+    # with the [0,1] (+1=open) normalization (mirrors convert.py).
+    out = np.asarray(_expected_motion_action_ours(cfg, raw_steps), dtype=np.float32).copy()
+    grip = unit_gripper_for_trajectory(cfg, raw_steps)
+    n = min(len(out), len(grip))
+    out[:n, 6] = grip[:n]
+    return out
+
+
+def _expected_motion_action_ours(cfg, raw_steps: list[dict]) -> np.ndarray:
+    """The 'ours' action with its ORIGINAL (pre-normalization) gripper; the
+    caller overwrites channel 6 with the unit gripper."""
     if cfg.action_kind == "abs_quat_7d":
         # iamlab: raw 8D [xyz, quat_wxyz, gripper] → 7D delta with **look-ahead**
         # convention (action[t] = command[t+1] - command[t]). Last frame: zero.
@@ -200,8 +226,8 @@ def independent_expected_action(cfg, raw_steps: list[dict]) -> np.ndarray:
     return np.stack([fn(s, None) for s in raw_steps])
 
 
-def numerical_equivalence(cfg, raw_steps, parquet_action) -> dict:
-    expected = independent_expected_action(cfg, raw_steps)
+def numerical_equivalence(cfg, raw_steps, parquet_action, fmt: str = "ours") -> dict:
+    expected = independent_expected_action(cfg, raw_steps, fmt)
     n = min(len(expected), len(parquet_action))
     diff = np.abs(expected[:n] - parquet_action[:n])
     return {
@@ -860,27 +886,32 @@ def side_by_side_gif(primary: Path, wrist: Path | None,
 
 # ---------------------------- driver ---------------------------- #
 
-def verify_one(short_name: str) -> dict:
+def verify_one(short_name: str, fmt: str = "ours") -> dict:
     cfg = get_config(short_name)
     print(f"  loading parquet…", flush=True)
-    lerobot = _read_lerobot_ep(cfg.name, ep_index=0)
+    lerobot = _read_lerobot_ep(cfg.name, ep_index=0, fmt=fmt)
     print(f"  re-reading first RLDS episode…", flush=True)
-    raw_steps = _read_rlds_first_episode(cfg)
+    raw_steps = _read_rlds_first_episode(cfg, fmt=fmt)
 
     # ① numerical equivalence
-    eq = numerical_equivalence(cfg, raw_steps, lerobot["action"])
+    eq = numerical_equivalence(cfg, raw_steps, lerobot["action"], fmt)
 
     # EE orientation per frame (from state) — reused by ⑥ round-trip and the animation.
     R_per_frame = extract_rotations(cfg, lerobot["state"], raw_steps)
 
     # ⑥ rotation round-trip: reconstruct R_{t+1} from R_t + action via scipy.
-    rot_rt = rotation_roundtrip(lerobot["action"], R_per_frame)
+    # Only meaningful for 'ours' (action[3:6] is a world-frame relative axis-angle).
+    # OpenVLA stores raw euler / absolute-euler in that slot, so the round-trip
+    # does not apply — skip it.
+    rot_rt = None
     rot_rt_b64 = None
-    if rot_rt is not None:
-        rot_rt_b64 = plot_rotation_error(
-            rot_rt["errs_deg"],
-            f"{cfg.name}: rotation round-trip geodesic error (deg)",
-        )
+    if fmt != "openvla":
+        rot_rt = rotation_roundtrip(lerobot["action"], R_per_frame)
+        if rot_rt is not None:
+            rot_rt_b64 = plot_rotation_error(
+                rot_rt["errs_deg"],
+                f"{cfg.name}: rotation round-trip geodesic error (deg)",
+            )
 
     # ② correlation w/ EE velocity
     ee_xyz = extract_ee_xyz(cfg, lerobot["state"], raw_steps)
@@ -891,9 +922,13 @@ def verify_one(short_name: str) -> dict:
         scatter_b64 = plot_action_vs_velocity(
             lerobot["action"], ee_xyz, f"{cfg.name}: action[:3] vs state-EE Δ"
         )
-        integ = integrated_xyz(lerobot["action"], ee_xyz[0])
+        # ∑action overlay only makes sense when action[:3] is a position delta.
+        # OpenVLA leaves some datasets absolute (ucsd_kitchen, iamlab) or in
+        # non-SI command units (taco_play), where integrating is meaningless.
+        integ = integrated_xyz(lerobot["action"], ee_xyz[0]) if fmt != "openvla" else None
+        dashed = "dashed=∑action+x₀" if fmt != "openvla" else "no ∑action (openvla raw units)"
         traj_b64 = plot_trajectory_3d(
-            ee_xyz, f"{cfg.name}: EE trajectory (solid=state, dashed=∑action+x₀)", integ
+            ee_xyz, f"{cfg.name}: EE trajectory (solid=state, {dashed})", integ
         )
         # animated 3D trajectory + EE coordinate frame — two flavors:
         #   GIF: plays in sync with the video GIF (same indices + fps) for hand-eye
@@ -903,7 +938,10 @@ def verify_one(short_name: str) -> dict:
         shared_fps = 8
         if R_per_frame is not None:
             print("  rendering 3D trajectory animation (GIF + interactive)…", flush=True)
-            action_rotvec = lerobot["action"][:, 3:6]
+            # The magenta arrow interprets action[3:6] as a world-frame axis-angle —
+            # true only for 'ours'. OpenVLA's rotation channel is raw euler, so we
+            # suppress the arrow (None) to avoid drawing a misleading vector.
+            action_rotvec = lerobot["action"][:, 3:6] if fmt != "openvla" else None
             traj_anim_b64 = animate_trajectory_with_frame(
                 ee_xyz, R_per_frame,
                 title=f"{cfg.name}: animated EE pose",
@@ -930,8 +968,9 @@ def verify_one(short_name: str) -> dict:
 
     return {
         "name":           cfg.name,
-        "action_kind":    cfg.action_kind,
-        "notes":          cfg.notes,
+        "fmt":            fmt,
+        "action_kind":    ("openvla_raw" if fmt == "openvla" else cfg.action_kind),
+        "notes":          (OPENVLA_ACTION_NOTES.get(cfg.name, "") if fmt == "openvla" else cfg.notes),
         "n_frames":       eq["n_frames"],
         "equivalence":    eq,
         "rot_roundtrip":  rot_rt,
@@ -990,13 +1029,23 @@ def _rot_cls(max_deg: float) -> str:
     return "bad"
 
 
-def render_html(results: list[dict], out_path: Path) -> None:
+def render_html(results: list[dict], out_path: Path, fmt: str = "ours") -> None:
+    fmt_label = {
+        "ours": "我们的格式（state 派生 7D 物理 delta，轴角旋转，SI 单位）",
+        "openvla": "OpenVLA 格式（逐帧复刻 OpenVLA 原始 action 变换，欧拉角旋转，原始单位）",
+    }.get(fmt, fmt)
+    openvla_note = ("<p class='muted'>注意：本报告为 <b>OpenVLA 格式</b>。⑥ 轴角 round-trip 与 ∑action 轨迹叠加、"
+                    "品红轴角箭头均不适用（OpenVLA 旋转通道是原始欧拉角、部分数据集为绝对位姿/非 SI 单位），已自动跳过。"
+                    "② 相关性对「delta 型」数据集仍有意义；对绝对位姿数据集（ucsd_kitchen / iamlab）相关性偏低属预期。</p>"
+                    if fmt == "openvla" else "")
     parts = ["<!doctype html><html><head><meta charset='utf-8'>",
              "<title>OXE → LeRobot v2 验证报告</title>",
              # Plotly.js for interactive 3D trajectory views (drag to rotate, scroll to zoom)
              "<script src='https://cdn.plot.ly/plotly-2.35.2.min.js' charset='utf-8'></script>",
              f"<style>{CSS}</style></head><body>",
              "<h1>OXE → LeRobot v2 转换验证报告</h1>",
+             f"<p><b>动作格式：</b>{fmt_label}</p>",
+             openvla_note,
              "<p>每个数据集跑 4 项检查：① 数值一致性 ② action 与 EE 速度相关性 ③ 时序图 ④ 视频回放。</p>",
              "<p class='muted'>提示：④ 中上方是与视频同步播放的 GIF（便于对比），下方的交互式 3D 视图支持鼠标拖拽旋转、滚轮缩放，可暂停在任意帧从不同角度查看。</p>"]
 
@@ -1105,17 +1154,28 @@ def render_html(results: list[dict], out_path: Path) -> None:
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Verify OXE → LeRobot v2 conversion.")
+    ap.add_argument("--format", choices=["ours", "openvla"], default="ours",
+                    help="which conversion to verify (reads data/lerobot or "
+                         "data/lerobot_openvla accordingly).")
+    ap.add_argument("--out", default=None, help="output HTML filename (under data/verification).")
+    ap.add_argument("--datasets", nargs="*", default=None,
+                    help="subset of dataset short names; default = all in VERIFY.")
+    args = ap.parse_args()
+
     out_dir = ROOT / "data" / "verification"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    names = args.datasets or VERIFY
     results = []
-    for name in VERIFY:
-        print(f"=== {name} ===")
-        results.append(verify_one(name))
+    for name in names:
+        print(f"=== {name} ({args.format}) ===")
+        results.append(verify_one(name, fmt=args.format))
 
-    out_name = sys.argv[1] if len(sys.argv) > 1 else "report_rotvec.html"
-    out = out_dir / out_name
-    render_html(results, out)
+    default_out = "report_openvla.html" if args.format == "openvla" else "report_rotvec.html"
+    out = out_dir / (args.out or default_out)
+    render_html(results, out, fmt=args.format)
     print(f"\nWrote {out}  ({out.stat().st_size // 1024} KB)")
 
 
